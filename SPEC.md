@@ -1,0 +1,76 @@
+# dynws Specification and Agent Routing
+
+## Summary
+
+`dynws` is a Rust CLI/TUI for building dynamic workspace sessions. The executable command is `dws`. A session is a named folder under `DYNWS_HOME` that contains symbolic links to selected repositories, so one IDE window can open a curated multi-repo context.
+
+Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate detection, idempotent session creation, symlink population, session listing, editor launching, TOML config, git branch/status indicators, and optional git worktree creation under `DYNWS_HOME`.
+
+## Public Interfaces
+
+- `dws`
+  - Launches the interactive TUI from the current directory.
+  - Lists immediate subdirectories, supports fuzzy filtering, multi-select, session naming, duplicate reuse, and explicit duplicate override.
+  - Opens the resulting session in the configured/default editor unless `--no-open` is passed.
+- `dws list`
+  - Opens an interactive existing-session picker in a terminal; pressing `enter` opens the highlighted workspace in the default editor.
+  - Prints existing sessions and linked repository paths when piped or when `--plain` is passed.
+- `dws path <session>`
+  - Prints the workspace folder for shell `cd` helpers.
+- `dws init <bash|zsh|fish>`
+  - Prints shell functions that allow the parent shell to `cd` into dynamic workspaces.
+- `dws zoxide sync`
+  - Adds existing dynamic workspace folders to zoxide when zoxide is installed.
+- `dws open <session> [--editor <name>]`
+  - Opens the workspace folder with a configured or explicitly selected editor.
+- `dws config editor list`
+  - Lists detected editor commands.
+- `dws config editor set <name>`
+  - Persists the default editor.
+- `dws config editor clear`
+  - Removes the persisted default editor.
+
+## Storage Layout
+
+- `DYNWS_HOME` overrides the root folder; otherwise a local `.dynws` folder is created in the directory where `dws` is run.
+- `<root>/config.toml` stores user config.
+- `<root>/sessions/<session>.toml` stores session metadata.
+- `<root>/workspaces/<session>/` stores symlinks to selected repositories.
+- `<root>/worktrees/<repo>/<worktree>/` stores optional git worktrees created from the TUI.
+
+## Implementation Modules
+
+- `cli`: clap command definitions.
+- `config`: path resolution, layout creation, TOML config loading/saving.
+- `session`: session metadata, duplicate detection, idempotent creation, symlink behavior.
+- `discovery`: current-directory subdirectory discovery with git status enrichment.
+- `git`: portable `git` CLI wrappers for branch/status/worktree operations.
+- `editor`: editor command detection, default selection, launch behavior.
+- `tui`: ratatui/crossterm interactive create flow.
+
+## Agent Routing
+
+- Agent 1 owns scaffold, dependency wiring, CLI, and config behavior.
+- Agent 2 owns session metadata, duplicate detection, idempotent creation, and symlink layout.
+- Agent 3 owns ratatui screens, fuzzy filtering, selection, naming, duplicate prompts, and keybindings.
+- Agent 4 owns git status/worktree behavior and editor detection/opening.
+- Agent 5 owns tests, README, and acceptance verification.
+
+## Acceptance Criteria
+
+- Running `dws` from a directory with subdirectories allows selecting repos and creating a named session.
+- Repeating the same selected repo set reuses the existing session unless the user explicitly creates a duplicate with a different name.
+- Session symlinks point to canonical original repository paths.
+- `dws list` shows an interactive picker in terminals, opens the highlighted workspace on `enter`, and keeps plain linked-repo output for `--plain` or piped usage.
+- `dws init zsh`/`bash`/`fish` enables `dws-cd <session>` in the parent shell, and zoxide-aware workflows can be synced with `dws zoxide sync`.
+- `dws open <session>` uses `--editor`, then config default, then a single detected editor.
+- Git repositories show branch and dirty status in the TUI; non-git folders remain selectable.
+- Pressing `w` on a git repository in the TUI prompts for a worktree name and creates it under `<root>/worktrees`.
+- `cargo test` passes.
+
+## Assumptions
+
+- Linux/macOS support is the v1 target; Windows symlink handling is intentionally out of scope.
+- Session metadata and user config are TOML.
+- The project uses the `git` command line rather than libgit2.
+- Worktrees are created only through the explicit TUI action.
