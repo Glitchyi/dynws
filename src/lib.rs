@@ -12,9 +12,15 @@ use clap::Parser;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::cli::{Cli, Commands, ConfigCommands, EditorCommands, Shell, ZoxideCommands};
+use crate::cli::{
+    Cli, Commands, ConfigCommands, EditorCommands, FileManagerCommands, ManageCommands, Shell,
+    ZoxideCommands,
+};
 use crate::config::{Config, DynwsPaths};
-use crate::editor::{Editor, detect_editors, open_editor, resolve_editor};
+use crate::editor::{
+    Editor, FileManager, detect_editors, detect_file_managers, open_editor, open_file_manager,
+    resolve_editor, resolve_file_manager,
+};
 use crate::session::{SessionMetadata, SessionStore};
 
 pub fn run() -> Result<()> {
@@ -84,8 +90,31 @@ pub fn run() -> Result<()> {
                 println!("synced {synced} workspace(s) to zoxide");
             }
         },
+        Some(Commands::Manage { command }) => {
+            let store = SessionStore::new(paths.clone());
+            match command {
+                Some(command) => handle_manage_command(&paths, &store, command)?,
+                None => {
+                    let sessions = store.load_sessions()?;
+                    if sessions.is_empty() {
+                        println!("no sessions found");
+                        return Ok(());
+                    }
+                    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                        bail!(
+                            "dws manage requires a terminal; use 'dws manage edit' or 'dws manage remove' for scripts"
+                        );
+                    }
+                    let changes = tui::run_session_manager(&paths, sessions)?;
+                    for change in changes {
+                        println!("{change}");
+                    }
+                }
+            }
+        }
         Some(Commands::Config { command }) => match command {
             ConfigCommands::Editor { command } => handle_editor_config(&paths, command)?,
+            ConfigCommands::FileManager { command } => handle_file_manager_config(&paths, command)?,
         },
     }
 
@@ -194,6 +223,81 @@ fn open_workspace_with_default_editor(
     Ok(selected)
 }
 
+fn reveal_session_with_default_file_manager(
+    paths: &DynwsPaths,
+    store: &SessionStore,
+    session: &SessionMetadata,
+) -> Result<FileManager> {
+    let workspace = store.workspace_path(&session.name);
+    let config = Config::load(paths)?;
+    let detected = detect_file_managers();
+    let selected = resolve_file_manager(None, config.file_manager.default.as_deref(), &detected)?;
+    open_file_manager(&selected, &workspace)?;
+    Ok(selected)
+}
+
+fn handle_manage_command(
+    paths: &DynwsPaths,
+    store: &SessionStore,
+    command: ManageCommands,
+) -> Result<()> {
+    match command {
+        ManageCommands::Edit {
+            session,
+            name,
+            description,
+            clear_description,
+        } => {
+            if name.is_none() && description.is_none() && !clear_description {
+                bail!("nothing to edit; pass --name, --description, or --clear-description");
+            }
+            if description.is_some() && clear_description {
+                bail!("use either --description or --clear-description, not both");
+            }
+
+            let original_name = store.load_session(&session)?.name;
+            let mut current_name = original_name.clone();
+            let mut updated = None;
+
+            if let Some(new_name) = name {
+                let metadata = store.rename_session(&current_name, &new_name)?;
+                current_name = metadata.name.clone();
+                updated = Some(metadata);
+            }
+
+            if description.is_some() || clear_description {
+                let metadata = store.set_session_description(
+                    &current_name,
+                    if clear_description { None } else { description },
+                )?;
+                updated = Some(metadata);
+            }
+
+            let updated = updated.context("no session update was applied")?;
+            if original_name == updated.name {
+                println!("updated session {}", updated.name);
+            } else {
+                println!("updated session {} -> {}", original_name, updated.name);
+            }
+        }
+        ManageCommands::Remove { session } => {
+            let removed = store.remove_session(&session)?;
+            println!("removed session {}", removed.name);
+        }
+        ManageCommands::Reveal { session } => {
+            let metadata = store.load_session(&session)?;
+            let selected = reveal_session_with_default_file_manager(paths, store, &metadata)?;
+            println!(
+                "revealed {} with {}",
+                metadata.name,
+                selected.command_line()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_editor_config(paths: &DynwsPaths, command: EditorCommands) -> Result<()> {
     let mut config = Config::load(paths)?;
 
@@ -236,6 +340,56 @@ fn handle_editor_config(paths: &DynwsPaths, command: EditorCommands) -> Result<(
     if let Some(default) = &config.editor.default {
         if default.trim().is_empty() {
             bail!("default editor cannot be empty");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_file_manager_config(paths: &DynwsPaths, command: FileManagerCommands) -> Result<()> {
+    let mut config = Config::load(paths)?;
+
+    match command {
+        FileManagerCommands::List => {
+            let detected = detect_file_managers();
+            if detected.is_empty() {
+                println!("no supported file manager commands detected");
+                return Ok(());
+            }
+
+            for file_manager in detected {
+                let command_line = file_manager.command_line();
+                let marker =
+                    if config.file_manager.default.as_deref() == Some(command_line.as_str()) {
+                        "default"
+                    } else {
+                        "detected"
+                    };
+                println!("{} ({}) - {}", command_line, file_manager.label, marker);
+            }
+        }
+        FileManagerCommands::Set { file_manager } => {
+            let detected = detect_file_managers();
+            let selected = resolve_file_manager(Some(&file_manager), None, &detected)
+                .with_context(|| format!("failed to resolve file manager '{file_manager}'"))?;
+            config.file_manager.default = Some(selected.command_line());
+            config.save(paths)?;
+            println!("default file manager set to {}", selected.command_line());
+        }
+        FileManagerCommands::Clear => {
+            if config.file_manager.default.is_none() {
+                println!("default file manager already unset");
+                return Ok(());
+            }
+            config.file_manager.default = None;
+            config.save(paths)?;
+            println!("default file manager cleared");
+        }
+    }
+
+    if let Some(default) = &config.file_manager.default {
+        if default.trim().is_empty() {
+            bail!("default file manager cannot be empty");
         }
     }
 

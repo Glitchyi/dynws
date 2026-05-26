@@ -11,10 +11,34 @@ pub struct Editor {
     pub command: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileManager {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl FileManager {
+    pub fn command_line(&self) -> String {
+        std::iter::once(self.command.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 struct KnownEditor {
     id: &'static str,
     label: &'static str,
     commands: &'static [&'static str],
+}
+
+struct KnownFileManager {
+    id: &'static str,
+    label: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
 }
 
 const KNOWN_EDITORS: &[KnownEditor] = &[
@@ -40,6 +64,27 @@ const KNOWN_EDITORS: &[KnownEditor] = &[
     },
 ];
 
+const KNOWN_FILE_MANAGERS: &[KnownFileManager] = &[
+    KnownFileManager {
+        id: "finder",
+        label: "Finder",
+        command: "open",
+        args: &[],
+    },
+    KnownFileManager {
+        id: "xdg-open",
+        label: "Linux desktop opener",
+        command: "xdg-open",
+        args: &[],
+    },
+    KnownFileManager {
+        id: "gio",
+        label: "GNOME file manager",
+        command: "gio",
+        args: &["open"],
+    },
+];
+
 pub fn detect_editors() -> Vec<Editor> {
     let mut editors = Vec::new();
     let mut seen = HashSet::new();
@@ -57,6 +102,24 @@ pub fn detect_editors() -> Vec<Editor> {
     }
 
     editors
+}
+
+pub fn detect_file_managers() -> Vec<FileManager> {
+    let mut managers = Vec::new();
+    let mut seen = HashSet::new();
+
+    for known in KNOWN_FILE_MANAGERS {
+        if command_exists(known.command) && seen.insert(command_line(known.command, known.args)) {
+            managers.push(FileManager {
+                id: known.id.to_string(),
+                label: known.label.to_string(),
+                command: known.command.to_string(),
+                args: known.args.iter().map(|arg| (*arg).to_string()).collect(),
+            });
+        }
+    }
+
+    managers
 }
 
 pub fn resolve_editor(
@@ -100,8 +163,52 @@ pub fn resolve_editor(
     }
 }
 
+pub fn resolve_file_manager(
+    explicit: Option<&str>,
+    default: Option<&str>,
+    detected: &[FileManager],
+) -> Result<FileManager> {
+    if let Some(requested) = explicit
+        .or(default)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(manager) = find_file_manager(requested, detected) {
+            return Ok(manager.clone());
+        }
+        if let Some(manager) = file_manager_from_command_line(requested) {
+            return Ok(manager);
+        }
+        bail!("file manager command was not found: {requested}");
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Some(manager) = file_manager_from_command_line("open") {
+            return Ok(manager);
+        }
+    }
+
+    match detected {
+        [single] => Ok(single.clone()),
+        [] => {
+            bail!(
+                "no supported file manager command detected; run `dws config file-manager set <command>`"
+            )
+        }
+        many => Ok(many[0].clone()),
+    }
+}
+
 pub fn open_editor(editor: &Editor, path: &Path) -> Result<()> {
     Command::new(&editor.command).arg(path).spawn()?;
+    Ok(())
+}
+
+pub fn open_file_manager(file_manager: &FileManager, path: &Path) -> Result<()> {
+    Command::new(&file_manager.command)
+        .args(&file_manager.args)
+        .arg(path)
+        .spawn()?;
     Ok(())
 }
 
@@ -111,6 +218,40 @@ fn find_editor<'a>(requested: &str, detected: &'a [Editor]) -> Option<&'a Editor
             || editor.command.eq_ignore_ascii_case(requested)
             || editor.label.eq_ignore_ascii_case(requested)
     })
+}
+
+fn find_file_manager<'a>(requested: &str, detected: &'a [FileManager]) -> Option<&'a FileManager> {
+    detected.iter().find(|manager| {
+        manager.id.eq_ignore_ascii_case(requested)
+            || manager.command.eq_ignore_ascii_case(requested)
+            || manager.label.eq_ignore_ascii_case(requested)
+            || manager.command_line().eq_ignore_ascii_case(requested)
+    })
+}
+
+fn file_manager_from_command_line(command_line: &str) -> Option<FileManager> {
+    let parts = command_line
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let (command, args) = parts.split_first()?;
+    if !command_exists(command) {
+        return None;
+    }
+
+    Some(FileManager {
+        id: command_line.to_string(),
+        label: command_line.to_string(),
+        command: (*command).to_string(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+    })
+}
+
+fn command_line(command: &str, args: &[&str]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn command_exists(command: &str) -> bool {
@@ -160,6 +301,23 @@ mod tests {
         ]
     }
 
+    fn file_managers() -> Vec<FileManager> {
+        vec![
+            FileManager {
+                id: "finder".to_string(),
+                label: "Finder".to_string(),
+                command: "open".to_string(),
+                args: Vec::new(),
+            },
+            FileManager {
+                id: "gio".to_string(),
+                label: "GNOME file manager".to_string(),
+                command: "gio".to_string(),
+                args: vec!["open".to_string()],
+            },
+        ]
+    }
+
     #[test]
     fn explicit_editor_wins_over_default() {
         let selected = resolve_editor(Some("cursor"), Some("code"), &editors()).unwrap();
@@ -179,5 +337,19 @@ mod tests {
         let error = resolve_editor(None, None, &editors()).unwrap_err();
 
         assert!(error.to_string().contains("multiple editors"));
+    }
+
+    #[test]
+    fn resolves_known_file_manager_by_id() {
+        let selected = resolve_file_manager(Some("gio"), None, &file_managers()).unwrap();
+
+        assert_eq!(selected.command_line(), "gio open");
+    }
+
+    #[test]
+    fn uses_first_detected_file_manager_when_unset() {
+        let selected = resolve_file_manager(None, None, &file_managers()).unwrap();
+
+        assert_eq!(selected.command, "open");
     }
 }

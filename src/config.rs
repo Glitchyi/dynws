@@ -59,10 +59,18 @@ impl DynwsPaths {
 pub struct Config {
     #[serde(default)]
     pub editor: EditorConfig,
+    #[serde(default)]
+    pub file_manager: FileManagerConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EditorConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileManagerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
 }
@@ -105,6 +113,7 @@ mod tests {
             editor: EditorConfig {
                 default: Some("code".to_string()),
             },
+            file_manager: FileManagerConfig::default(),
         };
 
         config.save(&paths).unwrap();
@@ -112,6 +121,43 @@ mod tests {
 
         assert_eq!(loaded, config);
         assert!(paths.config_file.exists());
+    }
+
+    #[test]
+    fn config_round_trips_default_file_manager() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path());
+        let config = Config {
+            editor: EditorConfig::default(),
+            file_manager: FileManagerConfig {
+                default: Some("open".to_string()),
+            },
+        };
+
+        config.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn config_loads_old_editor_only_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path());
+        paths.ensure_layout().unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"
+[editor]
+default = "code"
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(&paths).unwrap();
+
+        assert_eq!(loaded.editor.default.as_deref(), Some("code"));
+        assert_eq!(loaded.file_manager.default, None);
     }
 
     #[test]

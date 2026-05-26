@@ -4,13 +4,13 @@
 
 `dynws` is a Rust CLI/TUI for building dynamic workspace sessions. The executable command is `dws`. A session is a named folder under `DYNWS_HOME` that contains symbolic links to selected repositories, so one IDE window can open a curated multi-repo context.
 
-Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate detection, idempotent session creation, symlink population, session listing, editor launching, TOML config, git branch/status indicators, and optional git worktree creation under `DYNWS_HOME`.
+Full v1 includes discovery, type-to-search multi-select TUI, session naming, duplicate detection, idempotent session creation, symlink population, session listing, editor launching, TOML config, git branch/status indicators, and optional origin-branch worktree creation under the resolved workspace root.
 
 ## Public Interfaces
 
 - `dws`
   - Launches the interactive TUI from the current directory.
-  - Lists immediate subdirectories, supports fuzzy filtering, multi-select, session naming, duplicate reuse, and explicit duplicate override.
+  - Lists immediate subdirectories, supports type-to-search fuzzy filtering, `Ctrl+S` normal selection, `Ctrl+W` worktree selection, session naming, duplicate reuse, and explicit duplicate override.
   - Opens the resulting session in the configured/default editor unless `--no-open` is passed.
 - `dws list`
   - Opens an interactive existing-session picker in a terminal; pressing `enter` opens the highlighted workspace in the default editor.
@@ -23,12 +23,26 @@ Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate de
   - Adds existing dynamic workspace folders to zoxide when zoxide is installed.
 - `dws open <session> [--editor <name>]`
   - Opens the workspace folder with a configured or explicitly selected editor.
+- `dws manage`
+  - Opens an interactive existing-session manager for multi-selecting, expanding, renaming, revealing, or removing sessions.
+- `dws manage edit <session> [--name <new-name>] [--description <text>] [--clear-description]`
+  - Updates session metadata. Renaming moves both the session TOML file and the workspace folder.
+- `dws manage remove <session>`
+  - Removes the session TOML file and workspace folder without removing linked repositories or generated worktrees.
+- `dws manage reveal <session>`
+  - Opens the session workspace in Finder or the configured file manager.
 - `dws config editor list`
   - Lists detected editor commands.
 - `dws config editor set <name>`
   - Persists the default editor.
 - `dws config editor clear`
   - Removes the persisted default editor.
+- `dws config file-manager list`
+  - Lists detected file manager commands.
+- `dws config file-manager set <command>`
+  - Persists the default file manager command for reveal actions.
+- `dws config file-manager clear`
+  - Removes the persisted default file manager command.
 
 ## Storage Layout
 
@@ -52,8 +66,8 @@ Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate de
 
 - Agent 1 owns scaffold, dependency wiring, CLI, and config behavior.
 - Agent 2 owns session metadata, duplicate detection, idempotent creation, and symlink layout.
-- Agent 3 owns ratatui screens, fuzzy filtering, selection, naming, duplicate prompts, and keybindings.
-- Agent 4 owns git status/worktree behavior and editor detection/opening.
+- Agent 3 owns ratatui screens, type-to-search filtering, selection, naming, branch prompts, duplicate prompts, and keybindings.
+- Agent 4 owns git status/origin-branch worktree behavior and editor detection/opening.
 - Agent 5 owns tests, README, and acceptance verification.
 
 ## Acceptance Criteria
@@ -64,8 +78,13 @@ Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate de
 - `dws list` shows an interactive picker in terminals, opens the highlighted workspace on `enter`, and keeps plain linked-repo output for `--plain` or piped usage.
 - `dws init zsh`/`bash`/`fish` enables `dws-cd <session>` in the parent shell, and zoxide-aware workflows can be synced with `dws zoxide sync`.
 - `dws open <session>` uses `--editor`, then config default, then a single detected editor.
-- Git repositories show branch and dirty status in the TUI; non-git folders remain selectable.
-- Pressing `w` on a git repository in the TUI prompts for a worktree name and creates it under `<root>/worktrees`.
+- `dws manage` can multi-select sessions, expand linked repos with `Right`, remove individual repo links, and reveal workspaces in Finder/file manager.
+- Individual repo-link removal deletes dws-created worktrees under `<root>/worktrees` with `git worktree remove`; non-dws linked repos are not deleted.
+- Scriptable manage subcommands work without a TTY.
+- Git repositories show branch and dirty status in the TUI; non-git folders remain selectable as normal repos.
+- Pressing `Ctrl+S` toggles normal repo selection; pressing `Ctrl+W` toggles worktree selection for git repos.
+- When worktrees are selected, the next stage shows an animated fetch screen while `git fetch origin --prune` runs in the background, falls back to `git fetch origin` on prune ref-lock failures, lists `origin/*` branches per repo, typing filters branches, and `Ctrl+S` selects the branch.
+- Selected worktrees are created or reused under `<root>/worktrees/<repo>/<branch-slug>` and linked into the session under the repo name.
 - `cargo test` passes.
 
 ## Assumptions
@@ -73,4 +92,4 @@ Full v1 includes discovery, fuzzy multi-select TUI, session naming, duplicate de
 - Linux/macOS support is the v1 target; Windows symlink handling is intentionally out of scope.
 - Session metadata and user config are TOML.
 - The project uses the `git` command line rather than libgit2.
-- Worktrees are created only through the explicit TUI action.
+- Worktrees are created only through explicit `Ctrl+W` worktree selection and branch confirmation in the TUI.

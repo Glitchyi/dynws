@@ -48,6 +48,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ZoxideCommands,
     },
+    /// Edit or remove existing sessions.
+    Manage {
+        #[command(subcommand)]
+        command: Option<ManageCommands>,
+    },
     /// Manage dws configuration.
     Config {
         #[command(subcommand)]
@@ -61,6 +66,11 @@ pub enum ConfigCommands {
     Editor {
         #[command(subcommand)]
         command: EditorCommands,
+    },
+    /// Manage the default file manager.
+    FileManager {
+        #[command(subcommand)]
+        command: FileManagerCommands,
     },
 }
 
@@ -77,6 +87,19 @@ pub enum EditorCommands {
     Clear,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum FileManagerCommands {
+    /// List detected supported file manager commands.
+    List,
+    /// Set the default file manager command.
+    Set {
+        /// File manager command.
+        file_manager: String,
+    },
+    /// Clear the default file manager command.
+    Clear,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Shell {
     Bash,
@@ -88,4 +111,32 @@ pub enum Shell {
 pub enum ZoxideCommands {
     /// Add all existing local dynamic workspaces to zoxide.
     Sync,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ManageCommands {
+    /// Edit an existing session's metadata.
+    Edit {
+        /// Session name to edit.
+        session: String,
+        /// Rename the session.
+        #[arg(long)]
+        name: Option<String>,
+        /// Set or replace the session description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Clear the session description.
+        #[arg(long)]
+        clear_description: bool,
+    },
+    /// Remove an existing session and its workspace folder.
+    Remove {
+        /// Session name to remove.
+        session: String,
+    },
+    /// Reveal a session workspace in the OS file manager.
+    Reveal {
+        /// Session name to reveal.
+        session: String,
+    },
 }
