@@ -2,7 +2,25 @@
 name = "dynws"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+authors = ["Glitchyi"]
+description = "Build focused multi-repository workspaces with symlinks and Git worktrees"
+license = "MIT"
+repository = "https://github.com/Glitchyi/dynws"
+homepage = "https://github.com/Glitchyi/dynws"
+readme = "README.md"
+keywords = ["workspace", "git", "worktree", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+default-run = "dws"
 autobins = false
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
 
 [[bin]]
 name = "dws"
