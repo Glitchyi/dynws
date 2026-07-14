@@ -879,11 +879,9 @@ impl App {
                 self.filter.clear();
                 self.cursor = 0;
             }
-            KeyCode::Char(character) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.filter.push(character);
-                    self.cursor = 0;
-                }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.push(character);
+                self.cursor = 0;
             }
             _ => {}
         }
@@ -959,12 +957,10 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return self.select_current_branch(picker);
             }
-            KeyCode::Char(character) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    picker.filter.push(character);
-                    self.cursor = 0;
-                    self.mode = Mode::Branch(picker);
-                }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.filter.push(character);
+                self.cursor = 0;
+                self.mode = Mode::Branch(picker);
             }
             _ => {}
         }
@@ -1724,11 +1720,9 @@ impl SessionManagerApp {
                 self.filter.clear();
                 self.cursor = 0;
             }
-            KeyCode::Char(character) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.filter.push(character);
-                    self.cursor = 0;
-                }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.push(character);
+                self.cursor = 0;
             }
             _ => {}
         }

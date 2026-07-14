@@ -250,17 +250,17 @@ impl SessionStore {
         fs::rename(&old_file, &backup_file)
             .with_context(|| format!("failed to stage {}", old_file.display()))?;
         let workspace_moved = fs::symlink_metadata(&old_workspace).is_ok();
-        if workspace_moved {
-            if let Err(error) = fs::rename(&old_workspace, &new_workspace) {
-                let _ = fs::rename(&backup_file, &old_file);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to rename workspace {} -> {}",
-                        old_workspace.display(),
-                        new_workspace.display()
-                    )
-                });
-            }
+        if workspace_moved
+            && let Err(error) = fs::rename(&old_workspace, &new_workspace)
+        {
+            let _ = fs::rename(&backup_file, &old_file);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to rename workspace {} -> {}",
+                    old_workspace.display(),
+                    new_workspace.display()
+                )
+            });
         }
 
         if let Err(error) = self.write_session_metadata(&metadata) {
@@ -294,21 +294,17 @@ impl SessionStore {
             .with_context(|| format!("failed to stage {}", file.display()))?;
 
         let workspace_exists = fs::symlink_metadata(&workspace).is_ok();
-        if workspace_exists {
-            if let Err(error) = fs::rename(&workspace, &staged_workspace) {
-                let _ = fs::rename(&staged_file, &file);
-                return Err(error)
-                    .with_context(|| format!("failed to stage {}", workspace.display()));
-            }
+        if workspace_exists && let Err(error) = fs::rename(&workspace, &staged_workspace) {
+            let _ = fs::rename(&staged_file, &file);
+            return Err(error)
+                .with_context(|| format!("failed to stage {}", workspace.display()));
         }
 
-        if workspace_exists {
-            if let Err(error) = fs::remove_dir_all(&staged_workspace) {
-                let _ = fs::rename(&staged_workspace, &workspace);
-                let _ = fs::rename(&staged_file, &file);
-                return Err(error)
-                    .with_context(|| format!("failed to remove {}", staged_workspace.display()));
-            }
+        if workspace_exists && let Err(error) = fs::remove_dir_all(&staged_workspace) {
+            let _ = fs::rename(&staged_workspace, &workspace);
+            let _ = fs::rename(&staged_file, &file);
+            return Err(error)
+                .with_context(|| format!("failed to remove {}", staged_workspace.display()));
         }
         let _ = fs::remove_file(&staged_file);
         Ok(metadata)
@@ -558,10 +554,8 @@ impl SessionStore {
             .map(|repo| repo.path.clone())
             .collect::<Vec<_>>();
 
-        if !allow_duplicate {
-            if let Some(existing) = self.find_duplicate(&repo_paths)? {
-                return Ok(CreateOutcome::Reused(existing));
-            }
+        if !allow_duplicate && let Some(existing) = self.find_duplicate(&repo_paths)? {
+            return Ok(CreateOutcome::Reused(existing));
         }
 
         let name = normalize_name(requested_name)?;
