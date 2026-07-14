@@ -1,8 +1,9 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(name = "dws")]
 #[command(about = "Dynamic workspace manager for multi-repo IDE sessions")]
+#[command(version)]
 pub struct Cli {
     /// Editor command to use after creating/reusing a session in the interactive flow.
     #[arg(long, global = false)]
@@ -16,15 +17,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// List existing sessions and their linked repositories.
-    List {
-        /// Print the plain text list even when running in a terminal.
-        #[arg(long)]
-        plain: bool,
-        /// Editor command or known editor name to use when opening from the list picker.
-        #[arg(long)]
-        editor: Option<String>,
-    },
+    /// Initialize dws for the repository collection rooted at the current directory.
+    Init,
     /// Open a session workspace in an IDE/editor.
     Open {
         /// Session name.
@@ -32,21 +26,6 @@ pub enum Commands {
         /// Editor command or known editor name to use for this launch.
         #[arg(long)]
         editor: Option<String>,
-    },
-    /// Print a session workspace path for shell cd helpers.
-    Path {
-        /// Session name.
-        session: String,
-    },
-    /// Print shell integration for cd helpers.
-    Init {
-        /// Shell to generate integration for.
-        shell: Shell,
-    },
-    /// Manage zoxide integration for dynamic workspaces.
-    Zoxide {
-        #[command(subcommand)]
-        command: ZoxideCommands,
     },
     /// Edit or remove existing sessions.
     Manage {
@@ -57,18 +36,6 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
-    },
-    /// Initialize the local dws project layout and defaults.
-    Setup {
-        /// Default editor command line to store.
-        #[arg(long)]
-        editor: Option<String>,
-        /// Default file manager/reveal command line to store.
-        #[arg(long)]
-        file_manager: Option<String>,
-        /// Run without the interactive setup TUI.
-        #[arg(long)]
-        yes: bool,
     },
 }
 
@@ -110,19 +77,6 @@ pub enum FileManagerCommands {
     },
     /// Clear the default file manager command.
     Clear,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ZoxideCommands {
-    /// Add all existing local dynamic workspaces to zoxide.
-    Sync,
 }
 
 #[derive(Debug, Subcommand)]

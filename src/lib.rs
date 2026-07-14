@@ -1,73 +1,70 @@
-pub mod cli;
-pub mod config;
-pub mod discovery;
-pub mod editor;
-pub mod git;
-pub mod session;
-pub mod tui;
-pub mod zoxide;
+mod cli;
+mod config;
+mod discovery;
+mod editor;
+mod git;
+mod session;
+mod tui;
 
-use anyhow::{Context, Result, bail};
-use clap::Parser;
 use std::io::IsTerminal;
 use std::path::Path;
 
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+
 use crate::cli::{
-    Cli, Commands, ConfigCommands, EditorCommands, FileManagerCommands, ManageCommands, Shell,
-    ZoxideCommands,
+    Cli, Commands, ConfigCommands, EditorCommands, FileManagerCommands, ManageCommands,
 };
-use crate::config::{Config, DynwsPaths, SetupConfig, write_setup_config};
+use crate::config::{Config, DynwsPaths};
 use crate::editor::{
     Editor, FileManager, detect_editors, detect_file_managers, open_editor, open_file_manager,
     resolve_editor, resolve_file_manager,
 };
-use crate::session::{SessionMetadata, SessionStore};
+use crate::session::{SessionMetadata, SessionPatch, SessionStore};
 
+#[doc(hidden)]
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli {
+        editor,
+        no_open,
+        command,
+    } = Cli::parse();
     let cwd = std::env::current_dir().context("failed to read current directory")?;
+
+    if command.is_some() && (editor.is_some() || no_open) {
+        bail!("--editor and --no-open are only valid for the bare 'dws' interactive command");
+    }
+
+    if matches!(command, Some(Commands::Init)) {
+        let paths = DynwsPaths::initialize_from(&cwd)?;
+        println!(
+            "initialized dws project for {}",
+            paths.collection_root.display()
+        );
+        println!("storage: {}", paths.home.display());
+        println!("marker: {}", paths.project_file.display());
+        return Ok(());
+    }
+
+    // Resolving before dispatch is the single initialization guard for every
+    // operational command, including the bare interactive flow.
     let paths = DynwsPaths::resolve_from(&cwd)?;
 
-    match cli.command {
+    match command {
         None => {
-            if let Some(session) = tui::run_interactive(&paths, &cwd)? {
+            if let Some(session) = tui::run_interactive(&paths, &paths.collection_root)? {
                 let store = SessionStore::new(paths.clone());
                 let workspace = store.workspace_path(&session.name);
-                zoxide::add_path_if_available(&workspace);
                 println!("session ready: {} ({})", session.name, workspace.display());
-                if !cli.no_open {
-                    match open_session_with_default_editor(&paths, &session, cli.editor.as_deref())
-                    {
-                        Ok(editor) => {
-                            println!("opened {} with {}", session.name, editor.command_line())
+                if !no_open {
+                    match open_session_with_default_editor(&paths, &session, editor.as_deref()) {
+                        Ok(selected) => {
+                            println!("opened {} with {}", session.name, selected.command_line())
                         }
                         Err(error) => {
                             println!("not opened: {error:#}");
-                            println!("cd target: {}", workspace.display());
+                            println!("workspace: {}", workspace.display());
                         }
-                    }
-                }
-            }
-        }
-        Some(Commands::List { plain, editor }) => {
-            let store = SessionStore::new(paths.clone());
-            let sessions = store.load_sessions()?;
-            if sessions.is_empty() {
-                println!("no sessions found");
-                return Ok(());
-            }
-
-            if plain || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                print_sessions(&sessions);
-            } else if let Some(session) = tui::run_session_picker(&paths, sessions)? {
-                let workspace = store.workspace_path(&session.name);
-                match open_session_with_default_editor(&paths, &session, editor.as_deref()) {
-                    Ok(selected) => {
-                        println!("opened {} with {}", session.name, selected.command_line())
-                    }
-                    Err(error) => {
-                        println!("not opened: {error:#}");
-                        println!("cd target: {}", workspace.display());
                     }
                 }
             }
@@ -78,22 +75,6 @@ pub fn run() -> Result<()> {
             let selected = open_session_with_default_editor(&paths, &metadata, editor.as_deref())?;
             println!("opened {} with {}", metadata.name, selected.command_line());
         }
-        Some(Commands::Path { session }) => {
-            let store = SessionStore::new(paths);
-            let metadata = store.load_session(&session)?;
-            println!("{}", store.workspace_path(&metadata.name).display());
-        }
-        Some(Commands::Init { shell }) => {
-            print_shell_init(shell);
-        }
-        Some(Commands::Zoxide { command }) => match command {
-            ZoxideCommands::Sync => {
-                let store = SessionStore::new(paths);
-                let sessions = store.load_sessions()?;
-                let synced = zoxide::sync_sessions(&store, &sessions)?;
-                println!("synced {synced} workspace(s) to zoxide");
-            }
-        },
         Some(Commands::Manage { command }) => {
             let store = SessionStore::new(paths.clone());
             match command {
@@ -106,10 +87,11 @@ pub fn run() -> Result<()> {
                     }
                     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
                         bail!(
-                            "dws manage requires a terminal; use 'dws manage edit' or 'dws manage remove' for scripts"
+                            "dws manage requires a terminal; use 'dws manage edit', 'dws manage remove', or 'dws manage reveal' for scripts"
                         );
                     }
-                    let changes = tui::run_session_manager(&paths, &cwd, sessions)?;
+                    let changes =
+                        tui::run_session_manager(&paths, &paths.collection_root, sessions)?;
                     for change in changes {
                         println!("{change}");
                     }
@@ -120,95 +102,10 @@ pub fn run() -> Result<()> {
             ConfigCommands::Editor { command } => handle_editor_config(&paths, command)?,
             ConfigCommands::FileManager { command } => handle_file_manager_config(&paths, command)?,
         },
-        Some(Commands::Setup {
-            editor,
-            file_manager,
-            yes,
-        }) => {
-            handle_setup_command(&paths, editor, file_manager, yes)?;
-        }
+        Some(Commands::Init) => unreachable!("init is handled before project resolution"),
     }
 
     Ok(())
-}
-
-fn print_shell_init(shell: Shell) {
-    match shell {
-        Shell::Bash | Shell::Zsh => print!("{POSIX_SHELL_INIT}"),
-        Shell::Fish => print!("{FISH_SHELL_INIT}"),
-    }
-}
-
-const POSIX_SHELL_INIT: &str = r#"# dws shell integration
-dws-cd() {
-  if [ "$#" -lt 1 ]; then
-    printf '%s\n' 'usage: dws-cd <session>' >&2
-    return 2
-  fi
-
-  local target
-  target="$(dws path "$1")" || return
-
-  if command -v zoxide >/dev/null 2>&1; then
-    zoxide add "$target" >/dev/null 2>&1 || true
-  fi
-
-  cd "$target"
-}
-
-dws-z() {
-  if ! command -v zoxide >/dev/null 2>&1; then
-    printf '%s\n' 'zoxide is not installed or not on PATH' >&2
-    return 127
-  fi
-
-  dws zoxide sync >/dev/null 2>&1 || true
-
-  local target
-  target="$(zoxide query "$@")" || return
-  cd "$target"
-}
-"#;
-
-const FISH_SHELL_INIT: &str = r#"# dws shell integration
-function dws-cd
-  if test (count $argv) -lt 1
-    echo 'usage: dws-cd <session>' >&2
-    return 2
-  end
-
-  set -l target (dws path $argv[1]); or return
-
-  if command -q zoxide
-    zoxide add $target >/dev/null 2>&1; or true
-  end
-
-  cd $target
-end
-
-function dws-z
-  if not command -q zoxide
-    echo 'zoxide is not installed or not on PATH' >&2
-    return 127
-  end
-
-  dws zoxide sync >/dev/null 2>&1; or true
-
-  set -l target (zoxide query $argv); or return
-  cd $target
-end
-"#;
-
-fn print_sessions(sessions: &[SessionMetadata]) {
-    for session in sessions {
-        println!("{}", session.name);
-        if let Some(description) = &session.description {
-            println!("  {description}");
-        }
-        for repo in &session.repos {
-            println!("  - {} -> {}", repo.name, repo.path);
-        }
-    }
 }
 
 fn open_session_with_default_editor(
@@ -229,7 +126,6 @@ fn open_workspace_with_default_editor(
     let config = Config::load(paths)?;
     let detected = detect_editors();
     let selected = resolve_editor(explicit_editor, config.editor.default.as_deref(), &detected)?;
-    zoxide::add_path_if_available(workspace);
     open_editor(&selected, workspace)?;
     Ok(selected)
 }
@@ -267,24 +163,17 @@ fn handle_manage_command(
             }
 
             let original_name = store.load_session(&session)?.name;
-            let mut current_name = original_name.clone();
-            let mut updated = None;
-
-            if let Some(new_name) = name {
-                let metadata = store.rename_session(&current_name, &new_name)?;
-                current_name = metadata.name.clone();
-                updated = Some(metadata);
-            }
-
-            if description.is_some() || clear_description {
-                let metadata = store.set_session_description(
-                    &current_name,
-                    if clear_description { None } else { description },
-                )?;
-                updated = Some(metadata);
-            }
-
-            let updated = updated.context("no session update was applied")?;
+            let updated = store.edit_session(
+                &original_name,
+                SessionPatch {
+                    name,
+                    description: if clear_description {
+                        Some(None)
+                    } else {
+                        description.map(Some)
+                    },
+                },
+            )?;
             if original_name == updated.name {
                 println!("updated session {}", updated.name);
             } else {
@@ -349,81 +238,7 @@ fn handle_editor_config(paths: &DynwsPaths, command: EditorCommands) -> Result<(
         }
     }
 
-    if let Some(default) = &config.editor.default {
-        if default.trim().is_empty() {
-            bail!("default editor cannot be empty");
-        }
-    }
-
     Ok(())
-}
-
-fn handle_setup_command(
-    paths: &DynwsPaths,
-    editor: Option<String>,
-    file_manager: Option<String>,
-    yes: bool,
-) -> Result<()> {
-    let current = Config::load(paths)?;
-    let initial = SetupConfig {
-        editor: editor.or(current.editor.default),
-        file_manager: file_manager.or(current.file_manager.default),
-    };
-
-    let setup = if yes {
-        Some(normalize_setup_config(initial)?)
-    } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        tui::run_setup(paths, initial)?
-            .map(normalize_setup_config)
-            .transpose()?
-    } else {
-        bail!("dws setup requires a terminal; pass --yes for non-interactive setup")
-    };
-
-    let Some(setup) = setup else {
-        println!("setup cancelled");
-        return Ok(());
-    };
-
-    write_setup_config(paths, &setup)?;
-    println!("initialized dws project at {}", paths.home.display());
-    println!("config: {}", paths.config_file.display());
-    if let Some(editor) = &setup.editor {
-        println!("default editor: {editor}");
-    }
-    if let Some(file_manager) = &setup.file_manager {
-        println!("default file manager: {file_manager}");
-    }
-    Ok(())
-}
-
-fn normalize_setup_config(setup: SetupConfig) -> Result<SetupConfig> {
-    let editor = setup
-        .editor
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let detected = detect_editors();
-            resolve_editor(Some(value), None, &detected).map(|editor| editor.command_line())
-        })
-        .transpose()?;
-    let file_manager = setup
-        .file_manager
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let detected = detect_file_managers();
-            resolve_file_manager(Some(value), None, &detected)
-                .map(|file_manager| file_manager.command_line())
-        })
-        .transpose()?;
-
-    Ok(SetupConfig {
-        editor,
-        file_manager,
-    })
 }
 
 fn handle_file_manager_config(paths: &DynwsPaths, command: FileManagerCommands) -> Result<()> {
@@ -464,12 +279,6 @@ fn handle_file_manager_config(paths: &DynwsPaths, command: FileManagerCommands) 
             config.file_manager.default = None;
             config.save(paths)?;
             println!("default file manager cleared");
-        }
-    }
-
-    if let Some(default) = &config.file_manager.default {
-        if default.trim().is_empty() {
-            bail!("default file manager cannot be empty");
         }
     }
 
