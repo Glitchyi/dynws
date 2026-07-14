@@ -532,9 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn uses_first_detected_file_manager_when_unset() {
+    fn uses_platform_file_manager_when_unset() {
         let selected = resolve_file_manager(None, None, &file_managers()).unwrap();
 
-        assert_eq!(selected.command, "open");
+        assert_eq!(
+            selected.command_line(),
+            default_file_manager_command_lines()[0]
+        );
     }
 }
