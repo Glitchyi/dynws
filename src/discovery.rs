@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::git::{GitRepoStatus, repo_status};
 
@@ -12,8 +13,22 @@ pub struct RepoCandidate {
     pub git: Option<GitRepoStatus>,
 }
 
+#[cfg(test)]
 pub fn discover_repos(cwd: &Path) -> Result<Vec<RepoCandidate>> {
-    let mut repos = Vec::new();
+    discover_repos_excluding(cwd, None)
+}
+
+pub fn discover_repos_excluding(
+    cwd: &Path,
+    excluded_home: Option<&Path>,
+) -> Result<Vec<RepoCandidate>> {
+    let excluded_home = excluded_home
+        .map(|path| {
+            path.canonicalize()
+                .with_context(|| format!("failed to canonicalize excluded home {}", path.display()))
+        })
+        .transpose()?;
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(cwd).with_context(|| format!("failed to read {}", cwd.display()))? {
         let entry = entry.context("failed to read directory entry")?;
         let path = entry.path();
@@ -24,16 +39,60 @@ pub fn discover_repos(cwd: &Path) -> Result<Vec<RepoCandidate>> {
         let canonical = path
             .canonicalize()
             .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        let git = repo_status(&canonical).unwrap_or(None);
-        repos.push(RepoCandidate {
-            name,
-            path: canonical,
-            git,
-        });
+        if excluded_home
+            .as_ref()
+            .is_some_and(|excluded| canonical.starts_with(excluded))
+        {
+            continue;
+        }
+        candidates.push((name, canonical));
     }
 
-    repos.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    let worker_count = candidates.len().min(8);
+    if worker_count == 0 {
+        return Ok(Vec::new());
+    }
+    let chunk_size = candidates.len().div_ceil(worker_count);
+    let mut repos = thread::scope(|scope| -> Result<Vec<RepoCandidate>> {
+        let handles = candidates
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(name, path)| RepoCandidate {
+                            name: name.clone(),
+                            path: path.clone(),
+                            git: repo_status(path).unwrap_or(None),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut repos = Vec::with_capacity(candidates.len());
+        for handle in handles {
+            repos.extend(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("repository discovery worker panicked"))?,
+            );
+        }
+        Ok(repos)
+    })?;
+
+    sort_repos(&mut repos);
     Ok(repos)
+}
+
+fn sort_repos(repos: &mut [RepoCandidate]) {
+    repos.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.path.cmp(&right.path))
+    });
 }
 
 pub fn fuzzy_matches(query: &str, candidate: &RepoCandidate) -> bool {
@@ -72,6 +131,56 @@ mod tests {
                 .map(|repo| repo.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn excludes_dynws_storage_and_symlinks_into_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".dynws");
+        fs::create_dir_all(home.join("worktrees/repo")).unwrap();
+        fs::create_dir(temp.path().join("actual-repo")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            home.join("worktrees/repo"),
+            temp.path().join("storage-alias"),
+        )
+        .unwrap();
+
+        let repos = discover_repos_excluding(temp.path(), Some(&home)).unwrap();
+
+        assert_eq!(
+            repos
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actual-repo"]
+        );
+    }
+
+    #[test]
+    fn sorting_has_deterministic_case_tiebreakers() {
+        let mut repos = vec![
+            RepoCandidate {
+                name: "repo".to_string(),
+                path: PathBuf::from("/collection/repo"),
+                git: None,
+            },
+            RepoCandidate {
+                name: "Repo".to_string(),
+                path: PathBuf::from("/collection/Repo"),
+                git: None,
+            },
+        ];
+
+        sort_repos(&mut repos);
+
+        assert_eq!(
+            repos
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Repo", "repo"]
         );
     }
 
