@@ -16,7 +16,7 @@ use crate::cli::{
     Cli, Commands, ConfigCommands, EditorCommands, FileManagerCommands, ManageCommands, Shell,
     ZoxideCommands,
 };
-use crate::config::{Config, DynwsPaths};
+use crate::config::{Config, DynwsPaths, SetupConfig, write_setup_config};
 use crate::editor::{
     Editor, FileManager, detect_editors, detect_file_managers, open_editor, open_file_manager,
     resolve_editor, resolve_file_manager,
@@ -38,7 +38,9 @@ pub fn run() -> Result<()> {
                 if !cli.no_open {
                     match open_session_with_default_editor(&paths, &session, cli.editor.as_deref())
                     {
-                        Ok(editor) => println!("opened {} with {}", session.name, editor.command),
+                        Ok(editor) => {
+                            println!("opened {} with {}", session.name, editor.command_line())
+                        }
                         Err(error) => {
                             println!("not opened: {error:#}");
                             println!("cd target: {}", workspace.display());
@@ -60,7 +62,9 @@ pub fn run() -> Result<()> {
             } else if let Some(session) = tui::run_session_picker(&paths, sessions)? {
                 let workspace = store.workspace_path(&session.name);
                 match open_session_with_default_editor(&paths, &session, editor.as_deref()) {
-                    Ok(selected) => println!("opened {} with {}", session.name, selected.command),
+                    Ok(selected) => {
+                        println!("opened {} with {}", session.name, selected.command_line())
+                    }
                     Err(error) => {
                         println!("not opened: {error:#}");
                         println!("cd target: {}", workspace.display());
@@ -72,7 +76,7 @@ pub fn run() -> Result<()> {
             let store = SessionStore::new(paths.clone());
             let metadata = store.load_session(&session)?;
             let selected = open_session_with_default_editor(&paths, &metadata, editor.as_deref())?;
-            println!("opened {} with {}", metadata.name, selected.command);
+            println!("opened {} with {}", metadata.name, selected.command_line());
         }
         Some(Commands::Path { session }) => {
             let store = SessionStore::new(paths);
@@ -105,7 +109,7 @@ pub fn run() -> Result<()> {
                             "dws manage requires a terminal; use 'dws manage edit' or 'dws manage remove' for scripts"
                         );
                     }
-                    let changes = tui::run_session_manager(&paths, sessions)?;
+                    let changes = tui::run_session_manager(&paths, &cwd, sessions)?;
                     for change in changes {
                         println!("{change}");
                     }
@@ -116,6 +120,13 @@ pub fn run() -> Result<()> {
             ConfigCommands::Editor { command } => handle_editor_config(&paths, command)?,
             ConfigCommands::FileManager { command } => handle_file_manager_config(&paths, command)?,
         },
+        Some(Commands::Setup {
+            editor,
+            file_manager,
+            yes,
+        }) => {
+            handle_setup_command(&paths, editor, file_manager, yes)?;
+        }
     }
 
     Ok(())
@@ -310,21 +321,22 @@ fn handle_editor_config(paths: &DynwsPaths, command: EditorCommands) -> Result<(
             }
 
             for editor in detected {
-                let marker = if config.editor.default.as_deref() == Some(editor.command.as_str()) {
+                let command_line = editor.command_line();
+                let marker = if config.editor.default.as_deref() == Some(command_line.as_str()) {
                     "default"
                 } else {
                     "detected"
                 };
-                println!("{} ({}) - {}", editor.command, editor.label, marker);
+                println!("{} ({}) - {}", command_line, editor.label, marker);
             }
         }
         EditorCommands::Set { editor } => {
             let detected = detect_editors();
             let selected = resolve_editor(Some(&editor), None, &detected)
                 .with_context(|| format!("failed to resolve editor '{editor}'"))?;
-            config.editor.default = Some(selected.command.clone());
+            config.editor.default = Some(selected.command_line());
             config.save(paths)?;
-            println!("default editor set to {}", selected.command);
+            println!("default editor set to {}", selected.command_line());
         }
         EditorCommands::Clear => {
             if config.editor.default.is_none() {
@@ -344,6 +356,74 @@ fn handle_editor_config(paths: &DynwsPaths, command: EditorCommands) -> Result<(
     }
 
     Ok(())
+}
+
+fn handle_setup_command(
+    paths: &DynwsPaths,
+    editor: Option<String>,
+    file_manager: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let current = Config::load(paths)?;
+    let initial = SetupConfig {
+        editor: editor.or(current.editor.default),
+        file_manager: file_manager.or(current.file_manager.default),
+    };
+
+    let setup = if yes {
+        Some(normalize_setup_config(initial)?)
+    } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        tui::run_setup(paths, initial)?
+            .map(normalize_setup_config)
+            .transpose()?
+    } else {
+        bail!("dws setup requires a terminal; pass --yes for non-interactive setup")
+    };
+
+    let Some(setup) = setup else {
+        println!("setup cancelled");
+        return Ok(());
+    };
+
+    write_setup_config(paths, &setup)?;
+    println!("initialized dws project at {}", paths.home.display());
+    println!("config: {}", paths.config_file.display());
+    if let Some(editor) = &setup.editor {
+        println!("default editor: {editor}");
+    }
+    if let Some(file_manager) = &setup.file_manager {
+        println!("default file manager: {file_manager}");
+    }
+    Ok(())
+}
+
+fn normalize_setup_config(setup: SetupConfig) -> Result<SetupConfig> {
+    let editor = setup
+        .editor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let detected = detect_editors();
+            resolve_editor(Some(value), None, &detected).map(|editor| editor.command_line())
+        })
+        .transpose()?;
+    let file_manager = setup
+        .file_manager
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let detected = detect_file_managers();
+            resolve_file_manager(Some(value), None, &detected)
+                .map(|file_manager| file_manager.command_line())
+        })
+        .transpose()?;
+
+    Ok(SetupConfig {
+        editor,
+        file_manager,
+    })
 }
 
 fn handle_file_manager_config(paths: &DynwsPaths, command: FileManagerCommands) -> Result<()> {

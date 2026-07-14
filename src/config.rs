@@ -75,6 +75,12 @@ pub struct FileManagerConfig {
     pub default: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SetupConfig {
+    pub editor: Option<String>,
+    pub file_manager: Option<String>,
+}
+
 impl Config {
     pub fn load(paths: &DynwsPaths) -> Result<Self> {
         if !paths.config_file.exists() {
@@ -95,6 +101,20 @@ impl Config {
             .with_context(|| format!("failed to write {}", paths.config_file.display()))?;
         Ok(())
     }
+}
+
+pub fn write_setup_config(paths: &DynwsPaths, setup: &SetupConfig) -> Result<Config> {
+    paths.ensure_layout()?;
+    let config = Config {
+        editor: EditorConfig {
+            default: setup.editor.clone(),
+        },
+        file_manager: FileManagerConfig {
+            default: setup.file_manager.clone(),
+        },
+    };
+    config.save(paths)?;
+    Ok(config)
 }
 
 pub fn display_path(path: &Path) -> String {

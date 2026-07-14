@@ -58,6 +58,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Initialize the local dws project layout and defaults.
+    Setup {
+        /// Default editor command line to store.
+        #[arg(long)]
+        editor: Option<String>,
+        /// Default file manager/reveal command line to store.
+        #[arg(long)]
+        file_manager: Option<String>,
+        /// Run without the interactive setup TUI.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

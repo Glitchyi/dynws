@@ -19,18 +19,24 @@ Full v1 includes discovery, type-to-search multi-select TUI, session naming, dup
   - Prints the workspace folder for shell `cd` helpers.
 - `dws init <bash|zsh|fish>`
   - Prints shell functions that allow the parent shell to `cd` into dynamic workspaces.
+- `dws setup [--editor <command-line>] [--file-manager <command-line>] [--yes]`
+  - Initializes the local project `.dynws` layout.
+  - Opens a TUI setup wizard in a terminal.
+  - In non-interactive mode, requires `--yes` and uses provided flags/defaults.
 - `dws zoxide sync`
   - Adds existing dynamic workspace folders to zoxide when zoxide is installed.
 - `dws open <session> [--editor <name>]`
   - Opens the workspace folder with a configured or explicitly selected editor.
 - `dws manage`
-  - Opens an interactive existing-session manager for multi-selecting, expanding, renaming, revealing, or removing sessions.
+  - Opens an interactive existing-session manager for multi-selecting, expanding, renaming, opening, adding repositories to, or removing sessions.
+  - Pressing `o` opens selected/highlighted workspaces in the default editor; pressing `Ctrl+O` opens a detected-editor picker for the same target.
+  - Inside an expanded session, pressing `Ctrl+A` opens the repository picker and adds one or more normal symlinks or origin-branch worktrees to that session.
 - `dws manage edit <session> [--name <new-name>] [--description <text>] [--clear-description]`
   - Updates session metadata. Renaming moves both the session TOML file and the workspace folder.
 - `dws manage remove <session>`
   - Removes the session TOML file and workspace folder without removing linked repositories or generated worktrees.
 - `dws manage reveal <session>`
-  - Opens the session workspace in Finder or the configured file manager.
+  - Opens the session workspace in Finder, a detected POSIX opener, or the configured file manager.
 - `dws config editor list`
   - Lists detected editor commands.
 - `dws config editor set <name>`
@@ -78,7 +84,9 @@ Full v1 includes discovery, type-to-search multi-select TUI, session naming, dup
 - `dws list` shows an interactive picker in terminals, opens the highlighted workspace on `enter`, and keeps plain linked-repo output for `--plain` or piped usage.
 - `dws init zsh`/`bash`/`fish` enables `dws-cd <session>` in the parent shell, and zoxide-aware workflows can be synced with `dws zoxide sync`.
 - `dws open <session>` uses `--editor`, then config default, then a single detected editor.
-- `dws manage` can multi-select sessions, expand linked repos with `Right`, remove individual repo links, and reveal workspaces in Finder/file manager.
+- `dws manage` can multi-select sessions, expand linked repos with `Right`, add normal links or worktrees with `Ctrl+A`, remove individual repo links, open workspaces in the default editor with `o`, and choose another detected editor with `Ctrl+O`.
+- `dws setup` creates the local layout and can persist default editor and reveal/file-manager command lines.
+- Configured editor and file-manager values may include arguments and are executed without shell interpolation.
 - Individual repo-link removal deletes dws-created worktrees under `<root>/worktrees` with `git worktree remove`; non-dws linked repos are not deleted.
 - Scriptable manage subcommands work without a TTY.
 - Git repositories show branch and dirty status in the TUI; non-git folders remain selectable as normal repos.
@@ -89,7 +97,10 @@ Full v1 includes discovery, type-to-search multi-select TUI, session naming, dup
 
 ## Assumptions
 
-- Linux/macOS support is the v1 target; Windows symlink handling is intentionally out of scope.
+- POSIX-style systems such as Linux, macOS, and other Unix-like environments are supported targets.
+- Windows-native support is intentionally out of scope because workspace sessions rely on POSIX symlink behavior.
+- Windows users should use WSL or another POSIX-like environment.
 - Session metadata and user config are TOML.
 - The project uses the `git` command line rather than libgit2.
 - Worktrees are created only through explicit `Ctrl+W` worktree selection and branch confirmation in the TUI.
+- Repository addition is interactive-only, targets one expanded session, and supports multiple normal-link and worktree selections in one pass.

@@ -18,11 +18,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Padding, Paragraph};
 
-use crate::config::{Config, DynwsPaths};
+use crate::config::{Config, DynwsPaths, SetupConfig};
 use crate::discovery::{RepoCandidate, discover_repos, fuzzy_matches};
-use crate::editor::{detect_file_managers, open_file_manager, resolve_file_manager};
+use crate::editor::{
+    Editor, FileManager, detect_editors, detect_file_managers, open_editor, resolve_editor,
+    resolve_file_manager,
+};
 use crate::git;
 use crate::session::{RepoLink, RepoSelection, SessionMetadata, SessionStore};
+use crate::zoxide;
 
 pub fn run_interactive(paths: &DynwsPaths, cwd: &Path) -> Result<Option<SessionMetadata>> {
     let repos = discover_repos(cwd)?;
@@ -58,6 +62,7 @@ pub fn run_session_picker(
 
 pub fn run_session_manager(
     paths: &DynwsPaths,
+    cwd: &Path,
     sessions: Vec<SessionMetadata>,
 ) -> Result<Vec<String>> {
     if sessions.is_empty() {
@@ -68,7 +73,15 @@ pub fn run_session_manager(
     let mut terminal = setup_terminal()?;
     let store = SessionStore::new(paths.clone());
     let mut app = SessionManagerApp::new(sessions, store);
-    let outcome = run_session_manager_app(&mut terminal, &mut app);
+    let outcome = run_session_manager_app(&mut terminal, &mut app, cwd);
+    restore_terminal(&mut terminal)?;
+    outcome
+}
+
+pub fn run_setup(paths: &DynwsPaths, initial: SetupConfig) -> Result<Option<SetupConfig>> {
+    let mut terminal = setup_terminal()?;
+    let mut app = SetupApp::new(paths.clone(), initial);
+    let outcome = run_setup_app(&mut terminal, &mut app);
     restore_terminal(&mut terminal)?;
     outcome
 }
@@ -136,6 +149,7 @@ fn run_session_picker_app(
 fn run_session_manager_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut SessionManagerApp,
+    cwd: &Path,
 ) -> Result<Vec<String>> {
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -149,15 +163,590 @@ fn run_session_manager_app(
 
             match app.handle_key(key) {
                 SessionManagerSignal::Continue => {}
+                SessionManagerSignal::AddRepos {
+                    session_name,
+                    repo_cursor,
+                } => run_add_repos_app(terminal, app, cwd, session_name, repo_cursor)?,
                 SessionManagerSignal::Done => return Ok(app.changes.clone()),
             }
         }
     }
 }
 
+fn run_add_repos_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    manager: &mut SessionManagerApp,
+    cwd: &Path,
+    session_name: String,
+    repo_cursor: usize,
+) -> Result<()> {
+    let Some(session) = manager
+        .sessions
+        .iter()
+        .find(|session| session.name == session_name)
+        .cloned()
+    else {
+        manager.message = format!("session '{session_name}' was not found");
+        manager.mode = SessionManagerMode::Browse;
+        return Ok(());
+    };
+
+    let repos = match discover_repos(cwd) {
+        Ok(repos) => addable_repo_candidates(&session, repos),
+        Err(error) => {
+            manager.message = error.to_string();
+            return Ok(());
+        }
+    };
+    if repos.is_empty() {
+        manager.message = format!("no new repositories found in {}", cwd.display());
+        return Ok(());
+    }
+
+    let mut add_app = App::for_add(repos, manager.store.clone(), session_name.clone());
+    match run_app(terminal, &mut add_app)? {
+        Some(updated) => {
+            manager.finish_repo_add(&session_name, updated, &add_app.added_repos);
+        }
+        None => {
+            manager.mode = SessionManagerMode::Expanded {
+                session_name,
+                repo_cursor,
+            };
+            manager.message = "add repositories cancelled".to_string();
+        }
+    }
+    Ok(())
+}
+
+fn run_setup_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut SetupApp,
+) -> Result<Option<SetupConfig>> {
+    loop {
+        terminal.draw(|frame| app.draw(frame))?;
+        if event::poll(Duration::from_millis(200))? {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            match app.handle_key(key) {
+                SetupSignal::Continue => {}
+                SetupSignal::Done(outcome) => return Ok(outcome),
+            }
+        }
+    }
+}
+
+enum SetupSignal {
+    Continue,
+    Done(Option<SetupConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupMode {
+    Editor,
+    EditorCustom(String),
+    FileManager,
+    FileManagerCustom(String),
+    Review,
+}
+
+struct SetupApp {
+    paths: DynwsPaths,
+    detected_editors: Vec<Editor>,
+    detected_file_managers: Vec<FileManager>,
+    selection: SetupConfig,
+    mode: SetupMode,
+    cursor: usize,
+    message: String,
+}
+
+impl SetupApp {
+    fn new(paths: DynwsPaths, selection: SetupConfig) -> Self {
+        Self {
+            paths,
+            detected_editors: detect_editors(),
+            detected_file_managers: detect_file_managers(),
+            selection,
+            mode: SetupMode::Editor,
+            cursor: 0,
+            message: String::new(),
+        }
+    }
+
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let area = frame.area();
+        frame.render_widget(
+            Block::default().style(Style::default().fg(theme::FG).bg(theme::BG)),
+            area,
+        );
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(8),
+                Constraint::Length(5),
+            ])
+            .split(area);
+
+        let header = Paragraph::new(self.header_lines())
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme::FG).bg(theme::BG))
+            .block(panel_block("setup", theme::PURPLE).padding(Padding::horizontal(1)));
+        frame.render_widget(header, chunks[0]);
+
+        match self.mode.clone() {
+            SetupMode::Editor => {
+                self.clamp_cursor(self.editor_choice_count());
+                let list = List::new(self.editor_items()).highlight_symbol(">").block(
+                    panel_block("default editor", theme::CYAN).padding(Padding::horizontal(1)),
+                );
+                frame.render_widget(list, chunks[1]);
+            }
+            SetupMode::EditorCustom(input) => {
+                let body = Paragraph::new(vec![
+                    Line::from("Enter an editor command line."),
+                    Line::from(vec![
+                        Span::styled("value  ", label_style(theme::CYAN)),
+                        Span::styled(empty_marker(&input), value_style()),
+                    ]),
+                ])
+                .style(Style::default().fg(theme::FG).bg(theme::BG))
+                .block(panel_block("custom editor", theme::CYAN).padding(Padding::horizontal(1)));
+                frame.render_widget(body, chunks[1]);
+            }
+            SetupMode::FileManager => {
+                self.clamp_cursor(self.file_manager_choice_count());
+                let list = List::new(self.file_manager_items())
+                    .highlight_symbol(">")
+                    .block(
+                        panel_block("reveal command", theme::CYAN).padding(Padding::horizontal(1)),
+                    );
+                frame.render_widget(list, chunks[1]);
+            }
+            SetupMode::FileManagerCustom(input) => {
+                let body = Paragraph::new(vec![
+                    Line::from("Enter a file-manager/reveal command line."),
+                    Line::from(vec![
+                        Span::styled("value  ", label_style(theme::CYAN)),
+                        Span::styled(empty_marker(&input), value_style()),
+                    ]),
+                ])
+                .style(Style::default().fg(theme::FG).bg(theme::BG))
+                .block(panel_block("custom reveal", theme::CYAN).padding(Padding::horizontal(1)));
+                frame.render_widget(body, chunks[1]);
+            }
+            SetupMode::Review => {
+                let body = Paragraph::new(self.review_lines())
+                    .style(Style::default().fg(theme::FG).bg(theme::BG))
+                    .block(panel_block("review", theme::GREEN).padding(Padding::horizontal(1)));
+                frame.render_widget(body, chunks[1]);
+            }
+        }
+
+        let footer = Paragraph::new(self.footer_lines())
+            .style(Style::default().fg(theme::FG).bg(theme::BG))
+            .block(panel_block("prompt", theme::BLUE).padding(Padding::horizontal(1)));
+        frame.render_widget(footer, chunks[2]);
+    }
+
+    fn header_lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![
+                Span::styled("dws project setup", label_style(theme::PURPLE)),
+                Span::raw("  "),
+                Span::styled(self.mode_name(), pill_style(theme::BLUE)),
+            ]),
+            Line::from(vec![
+                Span::styled("root  ", label_style(theme::CYAN)),
+                Span::raw(self.paths.home.display().to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled("config  ", label_style(theme::CYAN)),
+                Span::raw(self.paths.config_file.display().to_string()),
+            ]),
+        ]
+    }
+
+    fn editor_items(&self) -> Vec<ListItem<'static>> {
+        let mut items = self
+            .detected_editors
+            .iter()
+            .enumerate()
+            .map(|(idx, editor)| {
+                self.choice_item(
+                    idx,
+                    editor.command_line(),
+                    Some(editor.label.clone()),
+                    self.selection.editor.as_deref() == Some(editor.command_line().as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(self.choice_item(
+            self.detected_editors.len(),
+            "custom command...".to_string(),
+            None,
+            false,
+        ));
+        items.push(self.choice_item(
+            self.detected_editors.len() + 1,
+            "skip default editor".to_string(),
+            None,
+            self.selection.editor.is_none(),
+        ));
+        items
+    }
+
+    fn file_manager_items(&self) -> Vec<ListItem<'static>> {
+        let mut items = self
+            .detected_file_managers
+            .iter()
+            .enumerate()
+            .map(|(idx, file_manager)| {
+                self.choice_item(
+                    idx,
+                    file_manager.command_line(),
+                    Some(file_manager.label.clone()),
+                    self.selection.file_manager.as_deref()
+                        == Some(file_manager.command_line().as_str()),
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(self.choice_item(
+            self.detected_file_managers.len(),
+            "custom command...".to_string(),
+            None,
+            false,
+        ));
+        items.push(self.choice_item(
+            self.detected_file_managers.len() + 1,
+            "skip reveal command".to_string(),
+            None,
+            self.selection.file_manager.is_none(),
+        ));
+        items
+    }
+
+    fn choice_item(
+        &self,
+        idx: usize,
+        value: String,
+        label: Option<String>,
+        selected: bool,
+    ) -> ListItem<'static> {
+        let highlighted = idx == self.cursor;
+        let marker = if selected { "*" } else { " " };
+        let style = if highlighted {
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::BLUE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::FG)
+        };
+        let mut spans = vec![
+            Span::styled(format!(" {marker} "), style),
+            Span::styled(value, style),
+        ];
+        if let Some(label) = label {
+            spans.push(Span::styled(
+                format!("  {label}"),
+                Style::default().fg(theme::FG_DIM),
+            ));
+        }
+        ListItem::new(Line::from(spans))
+    }
+
+    fn review_lines(&self) -> Vec<Line<'static>> {
+        vec![
+            Line::from(vec![
+                Span::styled("layout  ", label_style(theme::CYAN)),
+                Span::raw(".dynws sessions/workspaces/worktrees"),
+            ]),
+            Line::from(vec![
+                Span::styled("editor  ", label_style(theme::CYAN)),
+                Span::styled(
+                    self.selection
+                        .editor
+                        .as_deref()
+                        .unwrap_or("<unset>")
+                        .to_string(),
+                    value_style(),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("reveal  ", label_style(theme::CYAN)),
+                Span::styled(
+                    self.selection
+                        .file_manager
+                        .as_deref()
+                        .unwrap_or("<unset>")
+                        .to_string(),
+                    value_style(),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(
+                "Shell helpers remain available through `dws init zsh`, `dws init bash`, or `dws init fish`.",
+            ),
+        ]
+    }
+
+    fn footer_lines(&self) -> Vec<Line<'static>> {
+        let primary = match &self.mode {
+            SetupMode::Editor | SetupMode::FileManager => Line::from(vec![
+                Span::styled("j/k", key_style()),
+                Span::raw(" move  "),
+                Span::styled("enter", key_style()),
+                Span::raw(" select  "),
+                Span::styled("q", key_style()),
+                Span::raw(" cancel"),
+            ]),
+            SetupMode::EditorCustom(_) | SetupMode::FileManagerCustom(_) => Line::from(vec![
+                Span::styled("type", key_style()),
+                Span::raw(" command  "),
+                Span::styled("enter", key_style()),
+                Span::raw(" accept  "),
+                Span::styled("esc", key_style()),
+                Span::raw(" back"),
+            ]),
+            SetupMode::Review => Line::from(vec![
+                Span::styled("enter", key_style()),
+                Span::raw(" write setup  "),
+                Span::styled("esc", key_style()),
+                Span::raw(" back  "),
+                Span::styled("q", key_style()),
+                Span::raw(" cancel"),
+            ]),
+        };
+
+        vec![primary, self.message_line()]
+    }
+
+    fn message_line(&self) -> Line<'static> {
+        if self.message.is_empty() {
+            return Line::from("");
+        }
+        Line::from(Span::styled(
+            self.message.clone(),
+            Style::default().fg(theme::YELLOW),
+        ))
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> SetupSignal {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return SetupSignal::Done(None);
+        }
+
+        match self.mode.clone() {
+            SetupMode::Editor => self.handle_editor_key(key),
+            SetupMode::EditorCustom(input) => self.handle_editor_custom_key(key, input),
+            SetupMode::FileManager => self.handle_file_manager_key(key),
+            SetupMode::FileManagerCustom(input) => self.handle_file_manager_custom_key(key, input),
+            SetupMode::Review => self.handle_review_key(key),
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) -> SetupSignal {
+        match key.code {
+            KeyCode::Char('q') => return SetupSignal::Done(None),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1, self.editor_choice_count()),
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1, self.editor_choice_count()),
+            KeyCode::Enter => self.select_editor(),
+            _ => {}
+        }
+        SetupSignal::Continue
+    }
+
+    fn handle_editor_custom_key(&mut self, key: KeyEvent, mut input: String) -> SetupSignal {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = SetupMode::Editor;
+                self.message.clear();
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                self.mode = SetupMode::EditorCustom(input);
+            }
+            KeyCode::Enter => match resolve_editor(Some(&input), None, &self.detected_editors) {
+                Ok(editor) => {
+                    self.selection.editor = Some(editor.command_line());
+                    self.mode = SetupMode::FileManager;
+                    self.cursor = 0;
+                    self.message.clear();
+                }
+                Err(error) => {
+                    self.message = error.to_string();
+                    self.mode = SetupMode::EditorCustom(input);
+                }
+            },
+            KeyCode::Char(character) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    input.push(character);
+                    self.mode = SetupMode::EditorCustom(input);
+                }
+            }
+            _ => {
+                self.mode = SetupMode::EditorCustom(input);
+            }
+        }
+        SetupSignal::Continue
+    }
+
+    fn handle_file_manager_key(&mut self, key: KeyEvent) -> SetupSignal {
+        match key.code {
+            KeyCode::Char('q') => return SetupSignal::Done(None),
+            KeyCode::Esc => {
+                self.mode = SetupMode::Editor;
+                self.cursor = 0;
+                self.message.clear();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_cursor(1, self.file_manager_choice_count());
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_cursor(-1, self.file_manager_choice_count());
+            }
+            KeyCode::Enter => self.select_file_manager(),
+            _ => {}
+        }
+        SetupSignal::Continue
+    }
+
+    fn handle_file_manager_custom_key(&mut self, key: KeyEvent, mut input: String) -> SetupSignal {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = SetupMode::FileManager;
+                self.message.clear();
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                self.mode = SetupMode::FileManagerCustom(input);
+            }
+            KeyCode::Enter => {
+                match resolve_file_manager(Some(&input), None, &self.detected_file_managers) {
+                    Ok(file_manager) => {
+                        self.selection.file_manager = Some(file_manager.command_line());
+                        self.mode = SetupMode::Review;
+                        self.cursor = 0;
+                        self.message.clear();
+                    }
+                    Err(error) => {
+                        self.message = error.to_string();
+                        self.mode = SetupMode::FileManagerCustom(input);
+                    }
+                }
+            }
+            KeyCode::Char(character) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    input.push(character);
+                    self.mode = SetupMode::FileManagerCustom(input);
+                }
+            }
+            _ => {
+                self.mode = SetupMode::FileManagerCustom(input);
+            }
+        }
+        SetupSignal::Continue
+    }
+
+    fn handle_review_key(&mut self, key: KeyEvent) -> SetupSignal {
+        match key.code {
+            KeyCode::Char('q') => return SetupSignal::Done(None),
+            KeyCode::Esc => {
+                self.mode = SetupMode::FileManager;
+                self.cursor = 0;
+            }
+            KeyCode::Enter => return SetupSignal::Done(Some(self.selection.clone())),
+            _ => {}
+        }
+        SetupSignal::Continue
+    }
+
+    fn select_editor(&mut self) {
+        if self.cursor < self.detected_editors.len() {
+            self.selection.editor = Some(self.detected_editors[self.cursor].command_line());
+            self.mode = SetupMode::FileManager;
+            self.cursor = 0;
+            self.message.clear();
+        } else if self.cursor == self.detected_editors.len() {
+            self.mode = SetupMode::EditorCustom(self.selection.editor.clone().unwrap_or_default());
+            self.message.clear();
+        } else {
+            self.selection.editor = None;
+            self.mode = SetupMode::FileManager;
+            self.cursor = 0;
+            self.message.clear();
+        }
+    }
+
+    fn select_file_manager(&mut self) {
+        if self.cursor < self.detected_file_managers.len() {
+            self.selection.file_manager =
+                Some(self.detected_file_managers[self.cursor].command_line());
+            self.mode = SetupMode::Review;
+            self.cursor = 0;
+            self.message.clear();
+        } else if self.cursor == self.detected_file_managers.len() {
+            self.mode = SetupMode::FileManagerCustom(
+                self.selection.file_manager.clone().unwrap_or_default(),
+            );
+            self.message.clear();
+        } else {
+            self.selection.file_manager = None;
+            self.mode = SetupMode::Review;
+            self.cursor = 0;
+            self.message.clear();
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self.mode {
+            SetupMode::Editor | SetupMode::EditorCustom(_) => "editor",
+            SetupMode::FileManager | SetupMode::FileManagerCustom(_) => "reveal",
+            SetupMode::Review => "review",
+        }
+    }
+
+    fn editor_choice_count(&self) -> usize {
+        self.detected_editors.len() + 2
+    }
+
+    fn file_manager_choice_count(&self) -> usize {
+        self.detected_file_managers.len() + 2
+    }
+
+    fn clamp_cursor(&mut self, len: usize) {
+        self.cursor = self.cursor.min(len.saturating_sub(1));
+    }
+
+    fn move_cursor(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+
+        self.cursor = if delta < 0 {
+            self.cursor.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.cursor + delta as usize).min(len - 1)
+        };
+    }
+}
+
 enum AppSignal {
     Continue,
     Done(Option<SessionMetadata>),
+}
+
+#[derive(Debug, Clone)]
+enum AppPurpose {
+    CreateSession,
+    AddRepos { session_name: String },
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +772,11 @@ struct WorktreeChoice {
     branch: git::OriginBranch,
 }
 
+struct MaterializedSelections {
+    selections: Vec<RepoSelection>,
+    created_worktrees: Vec<std::path::PathBuf>,
+}
+
 struct BranchFetch {
     repo_indices: Vec<usize>,
     current: usize,
@@ -203,6 +797,8 @@ struct App {
     mode: Mode,
     branch_fetch: Option<BranchFetch>,
     store: SessionStore,
+    purpose: AppPurpose,
+    added_repos: Vec<RepoLink>,
 }
 
 impl App {
@@ -219,6 +815,15 @@ impl App {
             mode: Mode::Select,
             branch_fetch: None,
             store,
+            purpose: AppPurpose::CreateSession,
+            added_repos: Vec::new(),
+        }
+    }
+
+    fn for_add(repos: Vec<RepoCandidate>, store: SessionStore, session_name: String) -> Self {
+        Self {
+            purpose: AppPurpose::AddRepos { session_name },
+            ..Self::new(repos, store)
         }
     }
 
@@ -241,7 +846,9 @@ impl App {
         let header = Paragraph::new(self.header_line())
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme::FG).bg(theme::BG))
-            .block(panel_block("dws", self.mode_color()).padding(Padding::horizontal(1)));
+            .block(
+                panel_block(&self.panel_title(), self.mode_color()).padding(Padding::horizontal(1)),
+            );
         frame.render_widget(header, chunks[0]);
 
         match &self.mode {
@@ -304,9 +911,16 @@ impl App {
 
     fn header_line(&self) -> Line<'static> {
         let mode = self.mode_name();
+        let heading = match &self.purpose {
+            AppPurpose::CreateSession => "dynamic workspace manager".to_string(),
+            AppPurpose::AddRepos { session_name } => {
+                format!("add repositories to {session_name}")
+            }
+        };
+        let quit_label = if self.is_adding() { " cancel" } else { " quit" };
         Line::from(vec![
             Span::styled(
-                "dynamic workspace manager  ",
+                format!("{heading}  "),
                 Style::default()
                     .fg(theme::PURPLE)
                     .add_modifier(Modifier::BOLD),
@@ -329,8 +943,19 @@ impl App {
             Span::styled("enter", key_style()),
             Span::raw(" next  "),
             Span::styled("q", key_style()),
-            Span::raw(" quit"),
+            Span::raw(quit_label),
         ])
+    }
+
+    fn panel_title(&self) -> String {
+        match &self.purpose {
+            AppPurpose::CreateSession => "dws".to_string(),
+            AppPurpose::AddRepos { session_name } => format!("dws manage add · {session_name}"),
+        }
+    }
+
+    fn is_adding(&self) -> bool {
+        matches!(self.purpose, AppPurpose::AddRepos { .. })
     }
 
     fn repo_item(&self, repo_idx: usize, highlighted: bool) -> ListItem<'static> {
@@ -703,6 +1328,8 @@ impl App {
                     self.message = "select at least one repo".to_string();
                 } else if !self.worktree_selected.is_empty() {
                     self.start_branch_selection();
+                } else if self.is_adding() {
+                    return self.try_add();
                 } else {
                     self.mode = Mode::Name;
                     self.message.clear();
@@ -801,7 +1428,7 @@ impl App {
                 self.mode = Mode::Branch(picker);
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_current_branch(picker)?
+                return self.select_current_branch(picker);
             }
             KeyCode::Char(character) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -930,11 +1557,11 @@ impl App {
         self.message.clear();
     }
 
-    fn select_current_branch(&mut self, picker: BranchPicker) -> Result<()> {
+    fn select_current_branch(&mut self, picker: BranchPicker) -> Result<AppSignal> {
         let Some(branch_idx) = self.current_branch_idx(&picker) else {
             self.message = "no matching branch".to_string();
             self.mode = Mode::Branch(picker);
-            return Ok(());
+            return Ok(AppSignal::Continue);
         };
         let repo_idx = picker.repo_indices[picker.current];
         self.worktree_choices.push(WorktreeChoice {
@@ -944,14 +1571,17 @@ impl App {
 
         let next = picker.current + 1;
         if next >= picker.repo_indices.len() {
+            if self.is_adding() {
+                return self.try_add();
+            }
             self.mode = Mode::Name;
             self.cursor = 0;
             self.message.clear();
-            return Ok(());
+            return Ok(AppSignal::Continue);
         }
 
         self.start_branch_fetch(picker.repo_indices, next);
-        Ok(())
+        Ok(AppSignal::Continue)
     }
 
     fn try_create(&mut self, allow_duplicate: bool) -> Result<AppSignal> {
@@ -960,7 +1590,7 @@ impl App {
             return Ok(AppSignal::Continue);
         }
 
-        let selected = self.materialize_selections()?;
+        let selected = self.materialize_selections()?.selections;
         if !allow_duplicate {
             let selected_paths = selected
                 .iter()
@@ -986,8 +1616,45 @@ impl App {
         }
     }
 
-    fn materialize_selections(&self) -> Result<Vec<RepoSelection>> {
+    fn try_add(&mut self) -> Result<AppSignal> {
+        let AppPurpose::AddRepos { session_name } = &self.purpose else {
+            return Ok(AppSignal::Continue);
+        };
+        let session_name = session_name.clone();
+        let materialized = match self.materialize_selections() {
+            Ok(materialized) => materialized,
+            Err(error) => {
+                self.mode = Mode::Select;
+                self.worktree_choices.clear();
+                self.message = error.to_string();
+                return Ok(AppSignal::Continue);
+            }
+        };
+
+        match self
+            .store
+            .add_repo_links(&session_name, &materialized.selections)
+        {
+            Ok(outcome) => {
+                self.added_repos = outcome.repos;
+                Ok(AppSignal::Done(Some(outcome.session)))
+            }
+            Err(error) => {
+                let cleanup = rollback_created_worktrees(&materialized.created_worktrees);
+                self.mode = Mode::Select;
+                self.worktree_choices.clear();
+                self.message = match cleanup {
+                    Some(cleanup) => format!("{error:#}; {cleanup}"),
+                    None => error.to_string(),
+                };
+                Ok(AppSignal::Continue)
+            }
+        }
+    }
+
+    fn materialize_selections(&self) -> Result<MaterializedSelections> {
         let mut selections = Vec::new();
+        let mut created_worktrees = Vec::new();
         for idx in &self.selected {
             let repo = &self.repos[*idx];
             selections.push(RepoSelection {
@@ -997,17 +1664,38 @@ impl App {
         }
         for choice in &self.worktree_choices {
             let repo = &self.repos[choice.repo_idx];
-            let path = git::create_worktree_from_origin(
+            let target = git::worktree_target_path(
                 &repo.path,
                 &self.store.paths().worktrees_dir,
                 &choice.branch,
             )?;
+            let existed = target.exists();
+            let path = match git::create_worktree_from_origin(
+                &repo.path,
+                &self.store.paths().worktrees_dir,
+                &choice.branch,
+            ) {
+                Ok(path) => path,
+                Err(error) => {
+                    let cleanup = rollback_created_worktrees(&created_worktrees);
+                    return match cleanup {
+                        Some(cleanup) => Err(anyhow::anyhow!("{error:#}; {cleanup}")),
+                        None => Err(error),
+                    };
+                }
+            };
+            if !existed {
+                created_worktrees.push(path.clone());
+            }
             selections.push(RepoSelection {
                 name: repo.name.clone(),
                 path,
             });
         }
-        Ok(selections)
+        Ok(MaterializedSelections {
+            selections,
+            created_worktrees,
+        })
     }
 
     fn current_repo_idx(&self) -> Option<usize> {
@@ -1269,6 +1957,10 @@ impl SessionPickerApp {
 
 enum SessionManagerSignal {
     Continue,
+    AddRepos {
+        session_name: String,
+        repo_cursor: usize,
+    },
     Done,
 }
 
@@ -1291,11 +1983,18 @@ enum SessionManagerMode {
         repo_name: String,
         repo_cursor: usize,
     },
+    EditorPicker {
+        session_names: Vec<String>,
+        cursor: usize,
+        default_editor: Option<String>,
+        return_mode: Box<SessionManagerMode>,
+    },
 }
 
 struct SessionManagerApp {
     sessions: Vec<SessionMetadata>,
     store: SessionStore,
+    detected_editors: Vec<Editor>,
     selected: BTreeSet<String>,
     cursor: usize,
     filter: String,
@@ -1309,6 +2008,7 @@ impl SessionManagerApp {
         Self {
             sessions,
             store,
+            detected_editors: detect_editors(),
             selected: BTreeSet::new(),
             cursor: 0,
             filter: String::new(),
@@ -1340,9 +2040,23 @@ impl SessionManagerApp {
             .block(panel_block("dws manage", mode_color).padding(Padding::horizontal(1)));
         frame.render_widget(header, chunks[0]);
 
-        match self.expanded_session_name() {
-            Some(session_name) => self.draw_repo_list(frame, chunks[1], &session_name),
-            None => self.draw_session_list(frame, chunks[1]),
+        match self.mode.clone() {
+            SessionManagerMode::EditorPicker {
+                cursor,
+                default_editor,
+                session_names,
+                ..
+            } => self.draw_editor_picker(
+                frame,
+                chunks[1],
+                cursor,
+                default_editor.as_deref(),
+                session_names.len(),
+            ),
+            _ => match self.expanded_session_name() {
+                Some(session_name) => self.draw_repo_list(frame, chunks[1], &session_name),
+                None => self.draw_session_list(frame, chunks[1]),
+            },
         }
 
         let footer = Paragraph::new(self.footer_lines())
@@ -1412,6 +2126,27 @@ impl SessionManagerApp {
         frame.render_widget(list, area);
     }
 
+    fn draw_editor_picker(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        cursor: usize,
+        default_editor: Option<&str>,
+        session_count: usize,
+    ) {
+        let items = self
+            .detected_editors
+            .iter()
+            .enumerate()
+            .map(|(idx, editor)| self.editor_picker_item(editor, idx == cursor, default_editor))
+            .collect::<Vec<_>>();
+        let title = format!("editors {} for {} session(s)", items.len(), session_count);
+        let list = List::new(items)
+            .highlight_symbol(">")
+            .block(panel_block(&title, theme::PURPLE).padding(Padding::horizontal(1)));
+        frame.render_widget(list, area);
+    }
+
     fn header_line(&self) -> Line<'static> {
         Line::from(vec![
             Span::styled(
@@ -1437,8 +2172,12 @@ impl SessionManagerApp {
             Span::raw(" edit  "),
             Span::styled("right", key_style()),
             Span::raw(" expand  "),
+            Span::styled("ctrl+a", key_style()),
+            Span::raw(" add  "),
             Span::styled("o", key_style()),
-            Span::raw(" reveal  "),
+            Span::raw(" open  "),
+            Span::styled("ctrl+o", key_style()),
+            Span::raw(" editor  "),
             Span::styled("ctrl+d", key_style()),
             Span::raw(" remove  "),
             Span::styled("q", key_style()),
@@ -1529,10 +2268,45 @@ impl SessionManagerApp {
         .style(style)
     }
 
+    fn editor_picker_item(
+        &self,
+        editor: &Editor,
+        highlighted: bool,
+        default_editor: Option<&str>,
+    ) -> ListItem<'static> {
+        let command_line = editor.command_line();
+        let is_default = default_editor == Some(command_line.as_str());
+        let style = if highlighted {
+            Style::default()
+                .fg(theme::FG)
+                .bg(theme::BG_HIGHLIGHT)
+                .add_modifier(Modifier::BOLD)
+        } else if is_default {
+            Style::default().fg(theme::GREEN).bg(theme::BG)
+        } else {
+            Style::default().fg(theme::FG_DIM).bg(theme::BG)
+        };
+        let marker = if is_default {
+            Span::styled(" default ", pill_style(theme::GREEN))
+        } else {
+            Span::styled(" editor ", pill_style(theme::BLUE))
+        };
+
+        ListItem::new(Line::from(vec![
+            marker,
+            Span::raw(" "),
+            Span::styled(
+                editor.label.clone(),
+                Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(command_line, Style::default().fg(theme::COMMENT)),
+        ]))
+        .style(style)
+    }
+
     fn footer_lines(&self) -> Vec<Line<'static>> {
-        let current = self.current_session();
-        let active = self.active_session();
-        let display_session = active.or(current);
+        let display_session = self.display_session();
         let path = display_session
             .map(|session| {
                 self.store
@@ -1572,6 +2346,23 @@ impl SessionManagerApp {
                 Span::raw("   "),
                 Span::styled("selected sessions ", label_style(theme::GREEN)),
                 Span::styled(selected_count, value_style()),
+            ]),
+            SessionManagerMode::EditorPicker {
+                session_names,
+                cursor,
+                ..
+            } => Line::from(vec![
+                Span::styled("open ", label_style(theme::PURPLE)),
+                Span::styled(format!("{} session(s)", session_names.len()), value_style()),
+                Span::raw("   "),
+                Span::styled("editor ", label_style(theme::CYAN)),
+                Span::styled(
+                    self.detected_editors
+                        .get(*cursor)
+                        .map(|editor| editor.command_line())
+                        .unwrap_or_else(|| "<none>".to_string()),
+                    value_style(),
+                ),
             ]),
             SessionManagerMode::ConfirmRemoveRepo {
                 session_name,
@@ -1628,15 +2419,21 @@ impl SessionManagerApp {
                 Span::styled("right", key_style()),
                 Span::raw(" expand  "),
                 Span::styled("o", key_style()),
-                Span::raw(" reveal"),
+                Span::raw(" open  "),
+                Span::styled("ctrl+o", key_style()),
+                Span::raw(" choose editor"),
             ]),
             SessionManagerMode::Expanded { .. } => Line::from(vec![
                 Span::styled("left/esc", key_style()),
                 Span::raw(" collapse  "),
+                Span::styled("ctrl+a", key_style()),
+                Span::raw(" add repos  "),
                 Span::styled("ctrl+d", key_style()),
                 Span::raw(" remove repo link  "),
                 Span::styled("o", key_style()),
-                Span::raw(" reveal workspace"),
+                Span::raw(" open workspace  "),
+                Span::styled("ctrl+o", key_style()),
+                Span::raw(" choose editor"),
             ]),
             SessionManagerMode::Rename { .. } => Line::from(vec![
                 Span::styled("enter", key_style()),
@@ -1654,6 +2451,12 @@ impl SessionManagerApp {
                 Span::styled("y", key_style()),
                 Span::raw(" removes repo link and dws-created worktree when applicable"),
             ]),
+            SessionManagerMode::EditorPicker { .. } => Line::from(vec![
+                Span::styled("enter", key_style()),
+                Span::raw(" open with highlighted editor  "),
+                Span::styled("esc/left", key_style()),
+                Span::raw(" cancel"),
+            ]),
         }
     }
 
@@ -1664,6 +2467,7 @@ impl SessionManagerApp {
             SessionManagerMode::ConfirmRemoveSessions { .. } => "remove",
             SessionManagerMode::Expanded { .. } => "repos",
             SessionManagerMode::ConfirmRemoveRepo { .. } => "remove repo",
+            SessionManagerMode::EditorPicker { .. } => "editor",
         }
     }
 
@@ -1674,6 +2478,7 @@ impl SessionManagerApp {
             SessionManagerMode::ConfirmRemoveSessions { .. } => theme::YELLOW,
             SessionManagerMode::Expanded { .. } => theme::CYAN,
             SessionManagerMode::ConfirmRemoveRepo { .. } => theme::YELLOW,
+            SessionManagerMode::EditorPicker { .. } => theme::PURPLE,
         }
     }
 
@@ -1700,6 +2505,18 @@ impl SessionManagerApp {
                 repo_name,
                 repo_cursor,
             } => self.handle_remove_repo_key(key, session_name, repo_name, repo_cursor),
+            SessionManagerMode::EditorPicker {
+                session_names,
+                cursor,
+                default_editor,
+                return_mode,
+            } => self.handle_editor_picker_key(
+                key,
+                session_names,
+                cursor,
+                default_editor,
+                return_mode,
+            ),
         }
     }
 
@@ -1719,7 +2536,10 @@ impl SessionManagerApp {
                 self.start_remove();
             }
             KeyCode::Right => self.expand_current_session(),
-            KeyCode::Char('o') => self.reveal_target_sessions(),
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.start_editor_picker_for_target_sessions();
+            }
+            KeyCode::Char('o') => self.open_target_sessions_with_default_editor(),
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.cursor = 0;
@@ -1768,11 +2588,82 @@ impl SessionManagerApp {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_remove_repo(session_name, repo_cursor);
             }
-            KeyCode::Char('o') => self.reveal_session(&session_name),
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return SessionManagerSignal::AddRepos {
+                    session_name,
+                    repo_cursor,
+                };
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let return_mode = SessionManagerMode::Expanded {
+                    session_name: session_name.clone(),
+                    repo_cursor,
+                };
+                self.start_editor_picker(vec![session_name], return_mode);
+            }
+            KeyCode::Char('o') => self.open_session_with_default_editor(&session_name),
             _ => {
                 self.mode = SessionManagerMode::Expanded {
                     session_name,
                     repo_cursor,
+                };
+            }
+        }
+        SessionManagerSignal::Continue
+    }
+
+    fn handle_editor_picker_key(
+        &mut self,
+        key: KeyEvent,
+        session_names: Vec<String>,
+        mut cursor: usize,
+        default_editor: Option<String>,
+        return_mode: Box<SessionManagerMode>,
+    ) -> SessionManagerSignal {
+        match key.code {
+            KeyCode::Char('q') => return SessionManagerSignal::Done,
+            KeyCode::Left | KeyCode::Esc => {
+                self.mode = *return_mode;
+                self.message = "editor open cancelled".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                cursor = self.move_editor_cursor(cursor, 1);
+                self.mode = SessionManagerMode::EditorPicker {
+                    session_names,
+                    cursor,
+                    default_editor,
+                    return_mode,
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                cursor = self.move_editor_cursor(cursor, -1);
+                self.mode = SessionManagerMode::EditorPicker {
+                    session_names,
+                    cursor,
+                    default_editor,
+                    return_mode,
+                };
+            }
+            KeyCode::Enter => {
+                let Some(editor) = self.detected_editors.get(cursor).cloned() else {
+                    self.message = "no editor selected".to_string();
+                    self.mode = SessionManagerMode::EditorPicker {
+                        session_names,
+                        cursor,
+                        default_editor,
+                        return_mode,
+                    };
+                    return SessionManagerSignal::Continue;
+                };
+                self.mode = *return_mode;
+                self.open_sessions_with_editor(&session_names, &editor);
+            }
+            _ => {
+                self.mode = SessionManagerMode::EditorPicker {
+                    session_names,
+                    cursor,
+                    default_editor,
+                    return_mode,
                 };
             }
         }
@@ -2025,62 +2916,148 @@ impl SessionManagerApp {
         self.message.clear();
     }
 
-    fn reveal_target_sessions(&mut self) {
+    fn finish_repo_add(
+        &mut self,
+        session_name: &str,
+        updated: SessionMetadata,
+        added: &[RepoLink],
+    ) {
+        let updated_name = updated.name.clone();
+        let first_added_name = added.first().map(|repo| repo.name.clone());
+        self.replace_session(session_name, updated);
+        let repo_cursor = first_added_name
+            .as_deref()
+            .and_then(|name| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.name == updated_name)
+                    .and_then(|session| session.repos.iter().position(|repo| repo.name == name))
+            })
+            .unwrap_or(0);
+        let count = added.len();
+        self.message = format!("added {count} repo link(s) to {updated_name}");
+        self.changes.push(self.message.clone());
+        self.mode = SessionManagerMode::Expanded {
+            session_name: updated_name,
+            repo_cursor,
+        };
+    }
+
+    fn start_editor_picker_for_target_sessions(&mut self) {
         let session_names = self.target_session_names();
         if session_names.is_empty() {
             self.message = "no matching session".to_string();
             return;
         }
+        self.start_editor_picker(session_names, SessionManagerMode::Browse);
+    }
 
-        let mut revealed = 0;
-        for session_name in session_names {
-            if self.reveal_session_by_name(&session_name).is_ok() {
-                revealed += 1;
-            } else {
+    fn start_editor_picker(&mut self, session_names: Vec<String>, return_mode: SessionManagerMode) {
+        if self.detected_editors.is_empty() {
+            self.message = "no detected editors to choose from".to_string();
+            return;
+        }
+
+        let default_editor = match Config::load(self.store.paths()) {
+            Ok(config) => config,
+            Err(error) => {
+                self.message = error.to_string();
                 return;
             }
         }
-        self.message = format!("revealed {revealed} session(s)");
+        .editor
+        .default;
+        let cursor = preferred_editor_cursor(&self.detected_editors, default_editor.as_deref());
+        self.mode = SessionManagerMode::EditorPicker {
+            session_names,
+            cursor,
+            default_editor,
+            return_mode: Box::new(return_mode),
+        };
+        self.message.clear();
     }
 
-    fn reveal_session(&mut self, session_name: &str) {
-        if self.reveal_session_by_name(session_name).is_ok() {
-            self.message = format!("revealed {session_name}");
+    fn open_target_sessions_with_default_editor(&mut self) {
+        let session_names = self.target_session_names();
+        if session_names.is_empty() {
+            self.message = "no matching session".to_string();
+            return;
         }
+        self.open_sessions_with_default_editor(&session_names);
     }
 
-    fn reveal_session_by_name(&mut self, session_name: &str) -> Result<()> {
+    fn open_session_with_default_editor(&mut self, session_name: &str) {
+        self.open_sessions_with_default_editor(&[session_name.to_string()]);
+    }
+
+    fn open_sessions_with_default_editor(&mut self, session_names: &[String]) {
+        let config = match Config::load(self.store.paths()) {
+            Ok(config) => config,
+            Err(error) => {
+                self.message = error.to_string();
+                return;
+            }
+        };
+        let editor = match resolve_editor(
+            None,
+            config.editor.default.as_deref(),
+            &self.detected_editors,
+        ) {
+            Ok(editor) => editor,
+            Err(error) => {
+                self.message = error.to_string();
+                return;
+            }
+        };
+        self.open_sessions_with_editor(session_names, &editor);
+    }
+
+    fn open_sessions_with_editor(&mut self, session_names: &[String], editor: &Editor) {
+        let mut opened_names = Vec::new();
+        for session_name in session_names {
+            match self.open_session_by_name_with_editor(session_name, editor) {
+                Ok(true) => opened_names.push(session_name.clone()),
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+        if opened_names.is_empty() {
+            if self.message.is_empty() {
+                self.message = "no matching session".to_string();
+            }
+            return;
+        }
+        self.message = if opened_names.len() == 1 {
+            format!("opened {} with {}", opened_names[0], editor.command_line())
+        } else {
+            format!(
+                "opened {} session(s) with {}",
+                opened_names.len(),
+                editor.command_line()
+            )
+        };
+    }
+
+    fn open_session_by_name_with_editor(
+        &mut self,
+        session_name: &str,
+        editor: &Editor,
+    ) -> Result<bool> {
         let Some(session) = self
             .sessions
             .iter()
             .find(|session| session.name == session_name)
         else {
             self.message = format!("session '{session_name}' was not found");
-            return Ok(());
+            return Ok(false);
         };
-
-        let config = match Config::load(self.store.paths()) {
-            Ok(config) => config,
-            Err(error) => {
-                self.message = error.to_string();
-                return Err(error);
-            }
-        };
-        let detected = detect_file_managers();
-        let selected =
-            match resolve_file_manager(None, config.file_manager.default.as_deref(), &detected) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    self.message = error.to_string();
-                    return Err(error);
-                }
-            };
         let workspace = self.store.workspace_path(&session.name);
-        if let Err(error) = open_file_manager(&selected, &workspace) {
+        zoxide::add_path_if_available(&workspace);
+        if let Err(error) = open_editor(editor, &workspace) {
             self.message = error.to_string();
             return Err(error);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -2097,6 +3074,19 @@ impl SessionManagerApp {
         };
     }
 
+    fn move_editor_cursor(&self, cursor: usize, delta: isize) -> usize {
+        let len = self.detected_editors.len();
+        if len == 0 {
+            return 0;
+        }
+
+        if delta < 0 {
+            cursor.saturating_sub(delta.unsigned_abs())
+        } else {
+            (cursor + delta as usize).min(len - 1)
+        }
+    }
+
     fn current_session(&self) -> Option<&SessionMetadata> {
         self.filtered_indices()
             .get(self.cursor)
@@ -2110,8 +3100,15 @@ impl SessionManagerApp {
                 .sessions
                 .iter()
                 .find(|session| session.name == *session_name),
+            SessionManagerMode::EditorPicker { session_names, .. } => session_names
+                .first()
+                .and_then(|name| self.sessions.iter().find(|session| session.name == *name)),
             _ => None,
         }
+    }
+
+    fn display_session(&self) -> Option<&SessionMetadata> {
+        self.active_session().or_else(|| self.current_session())
     }
 
     fn target_session_names(&self) -> Vec<String> {
@@ -2230,6 +3227,47 @@ enum RepoLinkStatus {
     Missing,
 }
 
+fn addable_repo_candidates(
+    session: &SessionMetadata,
+    repos: Vec<RepoCandidate>,
+) -> Vec<RepoCandidate> {
+    let linked_names = session
+        .repos
+        .iter()
+        .map(|repo| repo.name.clone())
+        .collect::<BTreeSet<_>>();
+    let linked_paths = session
+        .repos
+        .iter()
+        .filter_map(|repo| Path::new(&repo.path).canonicalize().ok())
+        .collect::<BTreeSet<_>>();
+
+    repos
+        .into_iter()
+        .filter(|repo| {
+            !linked_names.contains(&repo.name) && !linked_paths.contains(repo.path.as_path())
+        })
+        .collect()
+}
+
+fn rollback_created_worktrees(paths: &[std::path::PathBuf]) -> Option<String> {
+    let failures = paths
+        .iter()
+        .rev()
+        .filter_map(|path| {
+            git::remove_worktree(path)
+                .err()
+                .map(|error| format!("{}: {error:#}", path.display()))
+        })
+        .collect::<Vec<_>>();
+    (!failures.is_empty()).then(|| {
+        format!(
+            "failed to clean up created worktree(s): {}",
+            failures.join("; ")
+        )
+    })
+}
+
 fn empty_marker(value: &str) -> String {
     if value.is_empty() {
         "<empty>".to_string()
@@ -2275,6 +3313,20 @@ fn session_matches(query: &str, session: &SessionMetadata) -> bool {
     }
 
     fuzzy_subsequence(&query.to_lowercase(), &haystack.to_lowercase())
+}
+
+fn preferred_editor_cursor(editors: &[Editor], default_editor: Option<&str>) -> usize {
+    let Some(default_editor) = default_editor else {
+        return 0;
+    };
+    if editors.len() <= 1 {
+        return 0;
+    }
+
+    editors
+        .iter()
+        .position(|editor| editor.command_line() != default_editor)
+        .unwrap_or(0)
 }
 
 fn fuzzy_text_matches(query: &str, text: &str) -> bool {
@@ -2346,7 +3398,204 @@ mod theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{EditorConfig, FileManagerConfig};
     use crate::git::GitRepoStatus;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn editor_script(label: &str, log: &Path) -> String {
+        format!(
+            r#"#!/bin/sh
+printf '{}:%s\n' "$*" >> "{}"
+"#,
+            label,
+            log.display()
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_editor(command: &Path, id: &str, label: &str) -> Editor {
+        Editor {
+            id: id.to_string(),
+            label: label.to_string(),
+            command: command.display().to_string(),
+            args: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_log(log: &Path) -> String {
+        for _ in 0..120 {
+            if let Ok(data) = fs::read_to_string(log) {
+                if !data.trim().is_empty() {
+                    return data;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("expected editor log at {}", log.display());
+    }
+
+    fn manager_session(name: &str) -> SessionMetadata {
+        SessionMetadata {
+            name: name.to_string(),
+            description: None,
+            repos: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_repo_dir(root: &Path, name: &str) -> std::path::PathBuf {
+        let path = root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    #[cfg(unix)]
+    fn repo_with_origin(root: &Path, name: &str) -> (std::path::PathBuf, git::OriginBranch) {
+        let origin = root.join(format!("{name}-origin.git"));
+        let repo = root.join(name);
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare"])
+                .arg(&origin)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("clone")
+                .arg(&origin)
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        run_git(&repo, &["checkout", "-b", "main"]);
+        fs::write(repo.join("README.md"), name).unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=dynws",
+                "-c",
+                "user.email=dynws@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(&repo, &["push", "-u", "origin", "main"]);
+        (
+            repo,
+            git::OriginBranch {
+                name: "main".to_string(),
+                remote_ref: "origin/main".to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn setup_app_can_skip_defaults_and_reach_review() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = SetupApp::new(
+            DynwsPaths::from_home(temp.path().join(".dynws")),
+            SetupConfig::default(),
+        );
+        app.detected_editors.clear();
+        app.detected_file_managers.clear();
+
+        app.cursor = 1;
+        app.select_editor();
+        assert!(matches!(app.mode, SetupMode::FileManager));
+        assert_eq!(app.selection.editor, None);
+
+        app.cursor = 1;
+        app.select_file_manager();
+        assert!(matches!(app.mode, SetupMode::Review));
+        assert_eq!(app.selection.file_manager, None);
+    }
+
+    #[test]
+    fn setup_app_accepts_custom_command_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = SetupApp::new(
+            DynwsPaths::from_home(temp.path().join(".dynws")),
+            SetupConfig::default(),
+        );
+        app.detected_editors.clear();
+        app.detected_file_managers.clear();
+        app.mode = SetupMode::EditorCustom("sh -c".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, SetupMode::FileManager));
+        assert_eq!(app.selection.editor.as_deref(), Some("sh -c"));
+
+        app.mode = SetupMode::FileManagerCustom("sh -c".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, SetupMode::Review));
+        assert_eq!(app.selection.file_manager.as_deref(), Some("sh -c"));
+    }
+
+    #[test]
+    fn setup_review_returns_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = SetupApp::new(
+            DynwsPaths::from_home(temp.path().join(".dynws")),
+            SetupConfig {
+                editor: Some("sh".to_string()),
+                file_manager: None,
+            },
+        );
+        app.mode = SetupMode::Review;
+
+        match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            SetupSignal::Done(Some(selection)) => {
+                assert_eq!(selection.editor.as_deref(), Some("sh"));
+                assert_eq!(selection.file_manager, None);
+            }
+            _ => panic!("expected setup completion"),
+        }
+    }
 
     #[test]
     fn normal_and_worktree_selection_are_mutually_exclusive() {
@@ -2373,6 +3622,271 @@ mod tests {
         app.toggle_current();
         assert!(app.selected.contains(&0));
         assert!(!app.worktree_selected.contains(&0));
+    }
+
+    #[test]
+    fn add_picker_q_cancels_without_leaving_the_manager_flow() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(DynwsPaths::from_home(temp.path().join(".dynws")));
+        let mut app = App::for_add(Vec::new(), store, "alpha".to_string());
+
+        let signal = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(matches!(signal, AppSignal::Done(None)));
+    }
+
+    #[test]
+    fn addable_candidates_exclude_linked_names_and_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = temp.path().join("linked");
+        let other = temp.path().join("other");
+        let fresh = temp.path().join("fresh");
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        let session = SessionMetadata {
+            repos: vec![RepoLink {
+                name: "linked-name".to_string(),
+                path: linked.canonicalize().unwrap().display().to_string(),
+            }],
+            ..manager_session("alpha")
+        };
+        let candidates = vec![
+            RepoCandidate {
+                name: "linked-name".to_string(),
+                path: other.canonicalize().unwrap(),
+                git: None,
+            },
+            RepoCandidate {
+                name: "same-path".to_string(),
+                path: linked.canonicalize().unwrap(),
+                git: None,
+            },
+            RepoCandidate {
+                name: "fresh".to_string(),
+                path: fresh.canonicalize().unwrap(),
+                git: None,
+            },
+        ];
+
+        let addable = addable_repo_candidates(&session, candidates);
+
+        assert_eq!(
+            addable
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
+    }
+
+    #[test]
+    fn session_manager_ctrl_a_adds_to_the_expanded_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(DynwsPaths::from_home(temp.path().join(".dynws")));
+        let mut app = SessionManagerApp::new(vec![manager_session("alpha")], store);
+        app.mode = SessionManagerMode::Expanded {
+            session_name: "alpha".to_string(),
+            repo_cursor: 2,
+        };
+
+        let signal = app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert!(matches!(
+            signal,
+            SessionManagerSignal::AddRepos {
+                ref session_name,
+                repo_cursor: 2,
+            } if session_name == "alpha"
+        ));
+    }
+
+    #[test]
+    fn session_manager_finishes_add_expanded_on_the_first_new_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(DynwsPaths::from_home(temp.path().join(".dynws")));
+        let mut app = SessionManagerApp::new(vec![manager_session("alpha")], store);
+        let added = vec![RepoLink {
+            name: "new-repo".to_string(),
+            path: temp.path().join("new-repo").display().to_string(),
+        }];
+        let updated = SessionMetadata {
+            repos: vec![
+                RepoLink {
+                    name: "existing".to_string(),
+                    path: temp.path().join("existing").display().to_string(),
+                },
+                added[0].clone(),
+            ],
+            ..manager_session("alpha")
+        };
+
+        app.finish_repo_add("alpha", updated, &added);
+
+        assert!(matches!(
+            app.mode,
+            SessionManagerMode::Expanded {
+                ref session_name,
+                repo_cursor: 1,
+            } if session_name == "alpha"
+        ));
+        assert_eq!(app.sessions[0].repos.len(), 2);
+        assert_eq!(app.changes, vec!["added 1 repo link(s) to alpha"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_picker_adds_normal_and_worktree_repositories_together() {
+        if !git_available() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let base = make_repo_dir(temp.path(), "base");
+        let normal = make_repo_dir(temp.path(), "normal");
+        let (repo, branch) = repo_with_origin(temp.path(), "worktree-repo");
+        let paths = DynwsPaths::from_home(&home);
+        let store = SessionStore::new(paths.clone());
+        store
+            .create_session("demo", std::slice::from_ref(&base), None, false)
+            .unwrap();
+        let mut app = App::for_add(
+            vec![
+                RepoCandidate {
+                    name: "normal".to_string(),
+                    path: normal.clone(),
+                    git: None,
+                },
+                RepoCandidate {
+                    name: "worktree-repo".to_string(),
+                    path: repo.clone(),
+                    git: git::repo_status(&repo).unwrap(),
+                },
+            ],
+            store.clone(),
+            "demo".to_string(),
+        );
+        app.selected.insert(0);
+        app.worktree_selected.insert(1);
+        app.worktree_choices.push(WorktreeChoice {
+            repo_idx: 1,
+            branch: branch.clone(),
+        });
+
+        let signal = app.try_add().unwrap();
+
+        assert!(matches!(signal, AppSignal::Done(Some(_))));
+        assert_eq!(app.added_repos.len(), 2);
+        assert_eq!(store.load_session("demo").unwrap().repos.len(), 3);
+        assert_eq!(
+            fs::read_link(home.join("workspaces/demo/normal")).unwrap(),
+            normal.canonicalize().unwrap()
+        );
+        let worktree = git::worktree_target_path(&repo, &paths.worktrees_dir, &branch).unwrap();
+        assert!(worktree.exists());
+        assert_eq!(
+            fs::read_link(home.join("workspaces/demo/worktree-repo")).unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_picker_rolls_back_a_created_worktree_when_another_fails() {
+        if !git_available() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let base = make_repo_dir(temp.path(), "base");
+        let (first_repo, first_branch) = repo_with_origin(temp.path(), "first");
+        let (second_repo, _) = repo_with_origin(temp.path(), "second");
+        let paths = DynwsPaths::from_home(&home);
+        let store = SessionStore::new(paths.clone());
+        store
+            .create_session("demo", std::slice::from_ref(&base), None, false)
+            .unwrap();
+        let mut app = App::for_add(
+            vec![
+                RepoCandidate {
+                    name: "first".to_string(),
+                    path: first_repo.clone(),
+                    git: git::repo_status(&first_repo).unwrap(),
+                },
+                RepoCandidate {
+                    name: "second".to_string(),
+                    path: second_repo.clone(),
+                    git: git::repo_status(&second_repo).unwrap(),
+                },
+            ],
+            store.clone(),
+            "demo".to_string(),
+        );
+        app.worktree_choices.push(WorktreeChoice {
+            repo_idx: 0,
+            branch: first_branch.clone(),
+        });
+        app.worktree_choices.push(WorktreeChoice {
+            repo_idx: 1,
+            branch: git::OriginBranch {
+                name: "missing".to_string(),
+                remote_ref: "origin/missing".to_string(),
+            },
+        });
+
+        let signal = app.try_add().unwrap();
+
+        assert!(matches!(signal, AppSignal::Continue));
+        let first_worktree =
+            git::worktree_target_path(&first_repo, &paths.worktrees_dir, &first_branch).unwrap();
+        assert!(!first_worktree.exists());
+        assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);
+        assert!(!app.message.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_picker_does_not_remove_a_reused_worktree_after_session_failure() {
+        if !git_available() {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let base = make_repo_dir(temp.path(), "base");
+        let (repo, branch) = repo_with_origin(temp.path(), "repo");
+        let paths = DynwsPaths::from_home(&home);
+        let store = SessionStore::new(paths.clone());
+        store
+            .create_session("demo", std::slice::from_ref(&base), None, false)
+            .unwrap();
+        let worktree =
+            git::create_worktree_from_origin(&repo, &paths.worktrees_dir, &branch).unwrap();
+        fs::write(home.join("workspaces/demo/repo"), "occupied").unwrap();
+        let mut app = App::for_add(
+            vec![RepoCandidate {
+                name: "repo".to_string(),
+                path: repo.clone(),
+                git: git::repo_status(&repo).unwrap(),
+            }],
+            store.clone(),
+            "demo".to_string(),
+        );
+        app.worktree_choices.push(WorktreeChoice {
+            repo_idx: 0,
+            branch,
+        });
+
+        let signal = app.try_add().unwrap();
+
+        assert!(matches!(signal, AppSignal::Continue));
+        assert!(worktree.exists());
+        assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);
+        assert!(app.message.contains("already exists"));
     }
 
     #[test]
@@ -2489,5 +4003,145 @@ mod tests {
                 repo_cursor: 0,
             } if session_name == "alpha"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_manager_o_opens_highlighted_session_with_default_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path().join(".dynws"));
+        let editor_path = temp.path().join("fake-editor");
+        let log = temp.path().join("open.log");
+        write_executable(&editor_path, &editor_script("default", &log));
+        let editor = fake_editor(&editor_path, "default", "Default");
+        Config {
+            editor: EditorConfig {
+                default: Some(editor.command_line()),
+            },
+            file_manager: FileManagerConfig::default(),
+        }
+        .save(&paths)
+        .unwrap();
+        let store = SessionStore::new(paths.clone());
+        let mut app = SessionManagerApp::new(vec![manager_session("alpha")], store);
+        app.detected_editors.clear();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        let logged = wait_for_log(&log);
+        assert!(logged.contains(&paths.workspaces_dir.join("alpha").display().to_string()));
+        assert!(app.message.contains("opened alpha with"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_manager_o_opens_selected_sessions_before_highlighted_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path().join(".dynws"));
+        let editor_path = temp.path().join("fake-editor");
+        let log = temp.path().join("open.log");
+        write_executable(&editor_path, &editor_script("default", &log));
+        let editor = fake_editor(&editor_path, "default", "Default");
+        Config {
+            editor: EditorConfig {
+                default: Some(editor.command_line()),
+            },
+            file_manager: FileManagerConfig::default(),
+        }
+        .save(&paths)
+        .unwrap();
+        let store = SessionStore::new(paths.clone());
+        let mut app = SessionManagerApp::new(
+            vec![manager_session("alpha"), manager_session("beta")],
+            store,
+        );
+        app.detected_editors.clear();
+        app.selected.insert("beta".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        let logged = wait_for_log(&log);
+        assert!(logged.contains(&paths.workspaces_dir.join("beta").display().to_string()));
+        assert!(!logged.contains(&paths.workspaces_dir.join("alpha").display().to_string()));
+        assert!(app.message.contains("opened beta with"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_manager_ctrl_o_picker_opens_chosen_non_default_editor() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path().join(".dynws"));
+        let code_path = temp.path().join("code");
+        let cursor_path = temp.path().join("cursor");
+        let log = temp.path().join("open.log");
+        write_executable(&code_path, &editor_script("code", &log));
+        write_executable(&cursor_path, &editor_script("cursor", &log));
+        let code = fake_editor(&code_path, "code", "VS Code");
+        let cursor = fake_editor(&cursor_path, "cursor", "Cursor");
+        Config {
+            editor: EditorConfig {
+                default: Some(code.command_line()),
+            },
+            file_manager: FileManagerConfig::default(),
+        }
+        .save(&paths)
+        .unwrap();
+        let store = SessionStore::new(paths.clone());
+        let mut app = SessionManagerApp::new(vec![manager_session("alpha")], store);
+        app.detected_editors = vec![code, cursor];
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            app.mode,
+            SessionManagerMode::EditorPicker { cursor: 1, .. }
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let logged = wait_for_log(&log);
+        assert!(logged.contains("cursor:"));
+        assert!(!logged.contains("code:"));
+        assert!(logged.contains(&paths.workspaces_dir.join("alpha").display().to_string()));
+    }
+
+    #[test]
+    fn session_manager_editor_picker_cancel_restores_expanded_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::from_home(temp.path().join(".dynws"));
+        let store = SessionStore::new(paths);
+        let mut app = SessionManagerApp::new(
+            vec![SessionMetadata {
+                repos: vec![RepoLink {
+                    name: "repo".to_string(),
+                    path: temp.path().join("repo").display().to_string(),
+                }],
+                ..manager_session("alpha")
+            }],
+            store,
+        );
+        app.detected_editors = vec![Editor {
+            id: "code".to_string(),
+            label: "VS Code".to_string(),
+            command: "code".to_string(),
+            args: Vec::new(),
+        }];
+        app.mode = SessionManagerMode::Expanded {
+            session_name: "alpha".to_string(),
+            repo_cursor: 0,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, SessionManagerMode::EditorPicker { .. }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(
+            app.mode,
+            SessionManagerMode::Expanded {
+                ref session_name,
+                repo_cursor: 0,
+            } if session_name == "alpha"
+        ));
+        assert!(app.message.contains("cancelled"));
     }
 }

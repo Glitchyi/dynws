@@ -40,6 +40,12 @@ pub struct RepoRemovalOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoAdditionOutcome {
+    pub session: SessionMetadata,
+    pub repos: Vec<RepoLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateOutcome {
     Created(SessionMetadata),
     Reused(SessionMetadata),
@@ -230,6 +236,113 @@ impl SessionStore {
         })
     }
 
+    pub fn add_repo_links(
+        &self,
+        session_name: &str,
+        repos: &[RepoSelection],
+    ) -> Result<RepoAdditionOutcome> {
+        let normalized = normalize_name(session_name)?;
+        let mut metadata = self.load_session(&normalized)?;
+        let canonical_repos = canonical_selection_set(repos)?;
+        let workspace = self.workspace_path(&normalized);
+
+        let mut link_names = metadata
+            .repos
+            .iter()
+            .map(|repo| repo.name.clone())
+            .collect::<HashSet<_>>();
+        let mut repo_paths = metadata
+            .repos
+            .iter()
+            .filter_map(|repo| PathBuf::from(&repo.path).canonicalize().ok())
+            .collect::<HashSet<_>>();
+
+        for repo in &canonical_repos {
+            if !link_names.insert(repo.name.clone()) {
+                bail!(
+                    "repo link '{}' already exists in session '{}'",
+                    repo.name,
+                    normalized
+                );
+            }
+            if !repo_paths.insert(repo.path.clone()) {
+                bail!(
+                    "repo path is already linked in session '{}': {}",
+                    normalized,
+                    repo.path.display()
+                );
+            }
+
+            let link_path = workspace.join(&repo.name);
+            match fs::symlink_metadata(&link_path) {
+                Ok(_) => bail!(
+                    "workspace link path already exists: {}",
+                    link_path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to inspect {}", link_path.display()));
+                }
+            }
+        }
+
+        self.paths.ensure_layout()?;
+        match fs::symlink_metadata(&workspace) {
+            Ok(workspace_metadata)
+                if !workspace_metadata.file_type().is_dir()
+                    || workspace_metadata.file_type().is_symlink() =>
+            {
+                bail!("workspace path is not a directory: {}", workspace.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&workspace)
+                    .with_context(|| format!("failed to create {}", workspace.display()))?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", workspace.display()));
+            }
+        }
+
+        let mut added = Vec::with_capacity(canonical_repos.len());
+        let mut created_links = Vec::with_capacity(canonical_repos.len());
+        for repo in &canonical_repos {
+            let link_path = workspace.join(&repo.name);
+            if let Err(error) = create_symlink(&repo.path, &link_path).with_context(|| {
+                format!(
+                    "failed to link {} -> {}",
+                    link_path.display(),
+                    repo.path.display()
+                )
+            }) {
+                rollback_created_links(&created_links);
+                return Err(error);
+            }
+            created_links.push(link_path);
+            added.push(RepoLink {
+                name: repo.name.clone(),
+                path: display_path(&repo.path),
+            });
+        }
+
+        metadata.repos.extend(added.clone());
+        metadata
+            .repos
+            .sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+        metadata.updated_at = current_timestamp();
+        if let Err(error) = self.write_session_metadata(&metadata) {
+            rollback_created_links(&created_links);
+            return Err(error);
+        }
+
+        Ok(RepoAdditionOutcome {
+            session: metadata,
+            repos: added,
+        })
+    }
+
     pub fn find_duplicate(&self, repos: &[PathBuf]) -> Result<Option<SessionMetadata>> {
         let selected = canonical_repo_set(repos)?;
 
@@ -331,9 +444,23 @@ impl SessionStore {
         self.paths.ensure_layout()?;
         let name = normalize_name(&metadata.name)?;
         let session_file = self.session_file(&name);
+        let temp_file = self.paths.sessions_dir.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
         let data = toml::to_string_pretty(metadata).context("failed to serialize session")?;
-        fs::write(&session_file, data)
-            .with_context(|| format!("failed to write {}", session_file.display()))?;
+        fs::write(&temp_file, data)
+            .with_context(|| format!("failed to write {}", temp_file.display()))?;
+        if let Err(error) = fs::rename(&temp_file, &session_file) {
+            let _ = fs::remove_file(&temp_file);
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to replace session metadata {}",
+                    session_file.display()
+                )
+            });
+        }
         Ok(())
     }
 
@@ -482,6 +609,12 @@ fn remove_workspace_path(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn rollback_created_links(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn create_or_validate_symlink(target: &Path, link: &Path) -> Result<()> {
@@ -716,6 +849,197 @@ mod tests {
         assert!(!home.join("sessions/demo.toml").exists());
         assert!(!home.join("workspaces/demo").exists());
         assert!(repo.exists());
+    }
+
+    #[test]
+    fn adds_repo_links_as_an_ordered_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repos = temp.path().join("repos");
+        let alpha = make_repo(&repos, "alpha");
+        let beta = make_repo(&repos, "beta");
+        let gamma = make_repo(&repos, "gamma");
+        let store = SessionStore::new(DynwsPaths::from_home(&home));
+        let created = store
+            .create_session(
+                "demo",
+                std::slice::from_ref(&alpha),
+                Some("keep this description".to_string()),
+                false,
+            )
+            .unwrap()
+            .into_metadata();
+
+        let outcome = store
+            .add_repo_links(
+                "demo",
+                &[
+                    RepoSelection {
+                        name: "gamma".to_string(),
+                        path: gamma.clone(),
+                    },
+                    RepoSelection {
+                        name: "beta".to_string(),
+                        path: beta.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome
+                .session
+                .repos
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert_eq!(
+            outcome
+                .repos
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta", "gamma"]
+        );
+        assert_eq!(outcome.session.created_at, created.created_at);
+        assert_eq!(
+            outcome.session.description.as_deref(),
+            Some("keep this description")
+        );
+        assert_eq!(
+            fs::read_link(home.join("workspaces/demo/beta")).unwrap(),
+            beta.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fs::read_link(home.join("workspaces/demo/gamma")).unwrap(),
+            gamma.canonicalize().unwrap()
+        );
+        assert!(alpha.exists());
+        assert!(beta.exists());
+        assert!(gamma.exists());
+    }
+
+    #[test]
+    fn rejects_duplicate_repo_links_without_mutating_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repos = temp.path().join("repos");
+        let alpha = make_repo(&repos, "alpha");
+        let beta = make_repo(&repos, "beta");
+        let store = SessionStore::new(DynwsPaths::from_home(&home));
+        store
+            .create_session("demo", std::slice::from_ref(&alpha), None, false)
+            .unwrap();
+
+        let duplicate_name = store
+            .add_repo_links(
+                "demo",
+                &[RepoSelection {
+                    name: "alpha".to_string(),
+                    path: beta.clone(),
+                }],
+            )
+            .unwrap_err();
+        assert!(duplicate_name.to_string().contains("already exists"));
+
+        let duplicate_path = store
+            .add_repo_links(
+                "demo",
+                &[RepoSelection {
+                    name: "beta".to_string(),
+                    path: alpha.clone(),
+                }],
+            )
+            .unwrap_err();
+        assert!(duplicate_path.to_string().contains("already linked"));
+
+        let loaded = store.load_session("demo").unwrap();
+        assert_eq!(loaded.repos.len(), 1);
+        assert!(!home.join("workspaces/demo/beta").exists());
+        assert!(alpha.exists());
+        assert!(beta.exists());
+    }
+
+    #[test]
+    fn validates_the_full_add_batch_before_creating_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repos = temp.path().join("repos");
+        let alpha = make_repo(&repos, "alpha");
+        let beta = make_repo(&repos, "beta");
+        let gamma = make_repo(&repos, "gamma");
+        let store = SessionStore::new(DynwsPaths::from_home(&home));
+        store
+            .create_session("demo", std::slice::from_ref(&alpha), None, false)
+            .unwrap();
+        fs::write(home.join("workspaces/demo/gamma"), "occupied").unwrap();
+
+        let error = store
+            .add_repo_links(
+                "demo",
+                &[
+                    RepoSelection {
+                        name: "beta".to_string(),
+                        path: beta,
+                    },
+                    RepoSelection {
+                        name: "gamma".to_string(),
+                        path: gamma,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already exists"));
+        assert!(!home.join("workspaces/demo/beta").exists());
+        assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);
+        assert!(store.add_repo_links("demo", &[]).is_err());
+        assert!(
+            store
+                .add_repo_links(
+                    "demo",
+                    &[RepoSelection {
+                        name: "missing".to_string(),
+                        path: temp.path().join("missing"),
+                    }],
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rolls_back_added_links_when_metadata_cannot_be_persisted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let alpha = make_repo(&temp.path().join("repos"), "alpha");
+        let beta = make_repo(&temp.path().join("repos"), "beta");
+        let store = SessionStore::new(DynwsPaths::from_home(&home));
+        store
+            .create_session("demo", std::slice::from_ref(&alpha), None, false)
+            .unwrap();
+        let sessions_dir = home.join("sessions");
+        let original_permissions = fs::metadata(&sessions_dir).unwrap().permissions();
+        let mut read_only = original_permissions.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(&sessions_dir, read_only).unwrap();
+
+        let result = store.add_repo_links(
+            "demo",
+            &[RepoSelection {
+                name: "beta".to_string(),
+                path: beta,
+            }],
+        );
+
+        fs::set_permissions(&sessions_dir, original_permissions).unwrap();
+        assert!(result.is_err());
+        assert!(!home.join("workspaces/demo/beta").exists());
+        assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);
     }
 
     #[test]

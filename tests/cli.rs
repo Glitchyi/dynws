@@ -1,7 +1,19 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+
+#[cfg(unix)]
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
 
 #[test]
 fn list_uses_dynws_home() {
@@ -97,11 +109,84 @@ fn init_zsh_prints_cd_and_zoxide_helpers() {
         .stdout(predicate::str::contains("zoxide add"));
 }
 
+#[test]
+fn setup_requires_yes_without_tty() {
+    let temp = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("dws")
+        .unwrap()
+        .env("DYNWS_HOME", temp.path().join("dynws-home"))
+        .arg("setup")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "dws setup requires a terminal; pass --yes",
+        ));
+}
+
+#[test]
+fn setup_yes_creates_project_layout_and_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("dynws-home");
+
+    Command::cargo_bin("dws")
+        .unwrap()
+        .env("DYNWS_HOME", &home)
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("initialized dws project"));
+
+    assert!(home.join("config.toml").exists());
+    assert!(home.join("sessions").is_dir());
+    assert!(home.join("workspaces").is_dir());
+    assert!(home.join("worktrees").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_yes_writes_editor_and_file_manager_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("dynws-home");
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    write_executable(&fake_bin.join("fake-editor"), "#!/bin/sh\nexit 0\n");
+    write_executable(&fake_bin.join("fake-open"), "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    Command::cargo_bin("dws")
+        .unwrap()
+        .env("DYNWS_HOME", &home)
+        .env("PATH", path)
+        .args([
+            "setup",
+            "--yes",
+            "--editor",
+            "fake-editor",
+            "--file-manager",
+            "fake-open --reveal",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default editor: fake-editor"))
+        .stdout(predicate::str::contains(
+            "default file manager: fake-open --reveal",
+        ));
+
+    let config = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(config.contains("[editor]"));
+    assert!(config.contains("default = \"fake-editor\""));
+    assert!(config.contains("[file_manager]"));
+    assert!(config.contains("default = \"fake-open --reveal\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn zoxide_sync_adds_existing_workspaces() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("dynws-home");
     let sessions = home.join("sessions");
@@ -123,7 +208,7 @@ updated_at = "2026-01-01T00:00:00Z"
     .unwrap();
 
     let fake_zoxide = fake_bin.join("zoxide");
-    fs::write(
+    write_executable(
         &fake_zoxide,
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -133,11 +218,7 @@ fi
 echo "$@" >> "$DWS_TEST_ZOXIDE_LOG"
 exit 0
 "#,
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&fake_zoxide).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fake_zoxide, permissions).unwrap();
+    );
 
     let path = format!(
         "{}:{}",
@@ -245,7 +326,6 @@ updated_at = "2026-01-01T00:00:00Z"
 #[cfg(unix)]
 #[test]
 fn manage_reveal_uses_configured_file_manager() {
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     let temp = tempfile::tempdir().unwrap();
@@ -279,16 +359,12 @@ default = "{}"
         ),
     )
     .unwrap();
-    fs::write(
+    write_executable(
         &fake_open,
         r#"#!/bin/sh
 echo "$@" > "$DWS_TEST_OPEN_LOG"
 "#,
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&fake_open).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fake_open, permissions).unwrap();
+    );
 
     Command::cargo_bin("dws")
         .unwrap()

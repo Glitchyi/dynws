@@ -2,13 +2,23 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Editor {
     pub id: String,
     pub label: String,
     pub command: String,
+    pub args: Vec<String>,
+}
+
+impl Editor {
+    pub fn command_line(&self) -> String {
+        command_line(
+            &self.command,
+            &self.args.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +93,24 @@ const KNOWN_FILE_MANAGERS: &[KnownFileManager] = &[
         command: "gio",
         args: &["open"],
     },
+    KnownFileManager {
+        id: "nautilus",
+        label: "Nautilus",
+        command: "nautilus",
+        args: &[],
+    },
+    KnownFileManager {
+        id: "dolphin",
+        label: "Dolphin",
+        command: "dolphin",
+        args: &[],
+    },
+    KnownFileManager {
+        id: "thunar",
+        label: "Thunar",
+        command: "thunar",
+        args: &[],
+    },
 ];
 
 pub fn detect_editors() -> Vec<Editor> {
@@ -96,6 +124,7 @@ pub fn detect_editors() -> Vec<Editor> {
                     id: known.id.to_string(),
                     label: known.label.to_string(),
                     command: (*command).to_string(),
+                    args: Vec::new(),
                 });
             }
         }
@@ -135,14 +164,8 @@ pub fn resolve_editor(
         if let Some(editor) = find_editor(requested, detected) {
             return Ok(editor.clone());
         }
-        if command_exists(requested) {
-            return Ok(Editor {
-                id: requested.to_string(),
-                label: requested.to_string(),
-                command: requested.to_string(),
-            });
-        }
-        bail!("editor command was not found: {requested}");
+        return editor_from_command_line(requested)
+            .with_context(|| format!("failed to resolve editor command '{requested}'"));
     }
 
     match detected {
@@ -176,14 +199,12 @@ pub fn resolve_file_manager(
         if let Some(manager) = find_file_manager(requested, detected) {
             return Ok(manager.clone());
         }
-        if let Some(manager) = file_manager_from_command_line(requested) {
-            return Ok(manager);
-        }
-        bail!("file manager command was not found: {requested}");
+        return file_manager_from_command_line(requested)
+            .with_context(|| format!("failed to resolve file manager command '{requested}'"));
     }
 
-    if cfg!(target_os = "macos") {
-        if let Some(manager) = file_manager_from_command_line("open") {
+    for command_line in default_file_manager_command_lines() {
+        if let Ok(manager) = file_manager_from_command_line(command_line) {
             return Ok(manager);
         }
     }
@@ -200,7 +221,10 @@ pub fn resolve_file_manager(
 }
 
 pub fn open_editor(editor: &Editor, path: &Path) -> Result<()> {
-    Command::new(&editor.command).arg(path).spawn()?;
+    Command::new(&editor.command)
+        .args(&editor.args)
+        .arg(path)
+        .spawn()?;
     Ok(())
 }
 
@@ -216,6 +240,7 @@ fn find_editor<'a>(requested: &str, detected: &'a [Editor]) -> Option<&'a Editor
     detected.iter().find(|editor| {
         editor.id.eq_ignore_ascii_case(requested)
             || editor.command.eq_ignore_ascii_case(requested)
+            || editor.command_line().eq_ignore_ascii_case(requested)
             || editor.label.eq_ignore_ascii_case(requested)
     })
 }
@@ -229,17 +254,16 @@ fn find_file_manager<'a>(requested: &str, detected: &'a [FileManager]) -> Option
     })
 }
 
-fn file_manager_from_command_line(command_line: &str) -> Option<FileManager> {
-    let parts = command_line
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    let (command, args) = parts.split_first()?;
+fn editor_from_command_line(command_line: &str) -> Result<Editor> {
+    let parts = parse_command_line(command_line)?;
+    let (command, args) = parts
+        .split_first()
+        .expect("parse_command_line returns at least one token");
     if !command_exists(command) {
-        return None;
+        bail!("editor command was not found: {command}");
     }
 
-    Some(FileManager {
+    Ok(Editor {
         id: command_line.to_string(),
         label: command_line.to_string(),
         command: (*command).to_string(),
@@ -247,11 +271,131 @@ fn file_manager_from_command_line(command_line: &str) -> Option<FileManager> {
     })
 }
 
+fn file_manager_from_command_line(command_line: &str) -> Result<FileManager> {
+    let parts = parse_command_line(command_line)?;
+    let (command, args) = parts
+        .split_first()
+        .expect("parse_command_line returns at least one token");
+    if !command_exists(command) {
+        bail!("file manager command was not found: {command}");
+    }
+
+    Ok(FileManager {
+        id: command_line.to_string(),
+        label: command_line.to_string(),
+        command: (*command).to_string(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+    })
+}
+
+pub fn parse_command_line(input: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_token = false;
+
+    for character in input.trim().chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            in_token = true;
+            continue;
+        }
+
+        if quote != Some('\'') && character == '\\' {
+            escaped = true;
+            in_token = true;
+            continue;
+        }
+
+        if let Some(quote_char) = quote {
+            if character == quote_char {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            in_token = true;
+            continue;
+        }
+
+        match character {
+            '"' | '\'' => {
+                quote = Some(character);
+                in_token = true;
+            }
+            value if value.is_whitespace() => {
+                if in_token {
+                    parts.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            value => {
+                current.push(value);
+                in_token = true;
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        bail!("unterminated quote in command line");
+    }
+    if in_token {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        bail!("command line cannot be empty");
+    }
+
+    Ok(parts)
+}
+
 fn command_line(command: &str, args: &[&str]) -> String {
     std::iter::once(command)
         .chain(args.iter().copied())
+        .map(quote_command_part)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn quote_command_part(part: &str) -> String {
+    if !part.is_empty()
+        && !part.chars().any(|character| {
+            character.is_whitespace() || character == '\'' || character == '"' || character == '\\'
+        })
+    {
+        return part.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    for character in part.chars() {
+        if character == '"' || character == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn default_file_manager_command_lines() -> &'static [&'static str] {
+    #[cfg(target_os = "macos")]
+    {
+        &["open"]
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        &["xdg-open", "gio open", "nautilus", "dolphin", "thunar"]
+    }
+
+    #[cfg(not(unix))]
+    {
+        &[]
+    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -292,11 +436,13 @@ mod tests {
                 id: "code".to_string(),
                 label: "VS Code".to_string(),
                 command: "code".to_string(),
+                args: Vec::new(),
             },
             Editor {
                 id: "cursor".to_string(),
                 label: "Cursor".to_string(),
                 command: "cursor".to_string(),
+                args: Vec::new(),
             },
         ]
     }
@@ -333,6 +479,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_command_lines_with_quotes() {
+        assert_eq!(
+            parse_command_line(r#"gio open "folder name" 'other value'"#).unwrap(),
+            vec!["gio", "open", "folder name", "other value"]
+        );
+        assert!(parse_command_line(r#"gio "open"#).is_err());
+        assert!(parse_command_line("   ").is_err());
+    }
+
+    #[test]
+    fn formats_command_lines_with_spaces_for_round_trip() {
+        let formatted = command_line("/tmp/my opener", &["--flag", "two words"]);
+
+        assert_eq!(formatted, r#""/tmp/my opener" --flag "two words""#);
+        assert_eq!(
+            parse_command_line(&formatted).unwrap(),
+            vec!["/tmp/my opener", "--flag", "two words"]
+        );
+    }
+
+    #[test]
+    fn resolves_custom_editor_command_lines() {
+        let selected = resolve_editor(Some("sh -c"), None, &[]).unwrap();
+
+        assert_eq!(selected.command, "sh");
+        assert_eq!(selected.args, vec!["-c"]);
+        assert_eq!(selected.command_line(), "sh -c");
+    }
+
+    #[test]
     fn errors_when_multiple_editors_have_no_default() {
         let error = resolve_editor(None, None, &editors()).unwrap_err();
 
@@ -344,6 +520,15 @@ mod tests {
         let selected = resolve_file_manager(Some("gio"), None, &file_managers()).unwrap();
 
         assert_eq!(selected.command_line(), "gio open");
+    }
+
+    #[test]
+    fn resolves_custom_file_manager_command_lines() {
+        let selected = resolve_file_manager(Some("sh -c"), None, &[]).unwrap();
+
+        assert_eq!(selected.command, "sh");
+        assert_eq!(selected.args, vec!["-c"]);
+        assert_eq!(selected.command_line(), "sh -c");
     }
 
     #[test]
