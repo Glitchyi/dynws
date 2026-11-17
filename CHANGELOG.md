@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Confirmed workspace cleanup
+
+- Session deletion can now remove extra workspace files and folders after a
+  second explicit confirmation listing the affected paths. Cancellation keeps
+  the whole batch; changed reviews are rejected and symlink targets are kept.
+- Interactive `dws remove` asks for `delete` when extra files exist; piped
+  invocations retain the conservative refusal.
+
 ### Opening and the session list
 
 - Ctrl+O chooses your editor, T3 Code or the desktop file manager; Space saves

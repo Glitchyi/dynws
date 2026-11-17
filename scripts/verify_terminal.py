@@ -299,6 +299,54 @@ def open_with_tests(root, env):
     run(root, env, "config", "clear", "file-manager")
 
 
+def cleanup_tests(root, env):
+    workspace = Path(create(root, env, "cleanup-confirm"))
+    report = workspace / "report.html"
+    report.write_text("keep until confirmed")
+    folder = workspace / "reports"
+    folder.mkdir()
+    (folder / "nested.txt").write_text("nested")
+    outside = root / "api/keep.txt"
+    outside.write_text("source file")
+    (folder / "outside").symlink_to(root / "api", target_is_directory=True)
+    term = Terminal([str(BINARY)], root, env)
+    try:
+        term.expect("Open a session")
+        term.send("cleanup-confirm\x04")
+        term.expect("Delete cleanup-confirm?")
+        term.send("y")
+        term.expect("Delete workspace files too?")
+        term.send("y\r")  # repeating the old confirmation must not delete files
+        term.expect("remove cancelled")
+        assert report.exists() and (folder / "nested.txt").exists()
+        term.send(b"\x04")
+        term.expect("Delete cleanup-confirm?")
+        term.send("y")
+        term.expect("Delete workspace files too?")
+        term.send("d")
+        term.expect("removed 1 session")
+        assert not workspace.exists()
+        assert outside.read_text() == "source file"
+        term.send(b"\x03")
+        term.finish()
+    finally:
+        term.close()
+    workspace = Path(create(root, env, "cli-cleanup"))
+    report = workspace / "notes.txt"
+    report.write_text("extra")
+    blocked = subprocess.run([str(BINARY), "remove", "cli-cleanup"], cwd=root, env=env, capture_output=True)
+    assert blocked.returncode != 0 and report.exists()
+    for answer in ["no", "delete"]:
+        term = Terminal([str(BINARY), "remove", "cli-cleanup"], root, env)
+        try:
+            term.expect("Type delete")
+            term.send(answer + "\r")
+            term.finish(expected=0 if answer == "delete" else 1)
+            assert report.exists() == (answer != "delete")
+        finally:
+            term.close()
+
+
 def terminal_tests(root, env):
     editor = root / "editor with spaces"
     record = root / "editor.json"
@@ -565,6 +613,7 @@ def main():
         run(root, env, "init")
         create(root, env, "api-review")
         open_with_tests(root, env)
+        cleanup_tests(root, env)
         terminal_tests(root, env)
         mouse_tests(root, env)
         worktree_workflow(root, env)

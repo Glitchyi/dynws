@@ -130,7 +130,28 @@ pub fn run() -> Result<()> {
             }
         }
         Some(Commands::Remove { session }) => {
-            let outcome = store.remove_sessions(&[session])?;
+            let names = [session];
+            let review = store.review_removal(&names)?;
+            let outcome = if review.extra_paths.is_empty() {
+                store.remove_sessions(&names)?
+            } else {
+                require_terminal().context("extra workspace files need confirmation; run dws interactively to review deletion")?;
+                eprintln!(
+                    "Also permanently delete these workspace files/folders? Folders include all contents; symlink targets are kept."
+                );
+                for path in &review.extra_paths {
+                    eprintln!("{}", path.display());
+                }
+                eprintln!(
+                    "Type delete to remove the sessions and these files; anything else cancels:"
+                );
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if answer.trim() != "delete" {
+                    bail!("removal cancelled");
+                }
+                store.remove_reviewed_sessions(&review)?
+            };
             for removed in outcome.sessions {
                 println!("removed session {}", removed.name);
             }

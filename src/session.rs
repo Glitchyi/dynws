@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -115,6 +115,29 @@ struct RemovalFault {
 pub struct RemovalOutcome {
     pub sessions: Vec<SessionMetadata>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemovalReview {
+    sessions: Vec<SessionMetadata>,
+    workspaces: Vec<WorkspaceSnapshot>,
+    pub extra_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct WorkspaceSnapshot {
+    identity: Option<(u64, u64)>,
+    entries: BTreeMap<PathBuf, EntryStamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EntryStamp {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,23 +358,93 @@ impl SessionStore {
         self.remove_sessions_staged(names, RemovalFault::default())
     }
 
+    /// Capture the exact workspace contents displayed for destructive confirmation.
+    pub fn review_removal(&self, names: &[String]) -> Result<RemovalReview> {
+        if self.lock.is_none() {
+            return self.locked()?.review_removal(names);
+        }
+        let mut review = RemovalReview {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            extra_paths: Vec::new(),
+        };
+        let mut unique = HashSet::new();
+        for name in names {
+            let session = self.load_session(name)?;
+            anyhow::ensure!(
+                unique.insert(session.name.clone()),
+                "duplicate removal target"
+            );
+            let workspace = self.workspace_path(&session.name);
+            let snapshot = snapshot_workspace(&workspace)?;
+            for relative in snapshot
+                .entries
+                .keys()
+                .filter(|path| path.components().count() == 1)
+            {
+                let path = workspace.join(relative);
+                let managed = session
+                    .repos
+                    .iter()
+                    .any(|repo| relative == Path::new(&repo.name))
+                    && fs::symlink_metadata(&path)?.file_type().is_symlink();
+                if !managed {
+                    review.extra_paths.push(path);
+                }
+            }
+            review.sessions.push(session);
+            review.workspaces.push(snapshot);
+        }
+        Ok(review)
+    }
+
+    pub fn remove_reviewed_sessions(&self, review: &RemovalReview) -> Result<RemovalOutcome> {
+        let names = review
+            .sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        self.remove_sessions_with_review(&names, RemovalFault::default(), Some(review))
+    }
+
     fn remove_sessions_staged(
         &self,
         names: &[String],
         fault: RemovalFault,
     ) -> Result<RemovalOutcome> {
+        self.remove_sessions_with_review(names, fault, None)
+    }
+
+    fn remove_sessions_with_review(
+        &self,
+        names: &[String],
+        fault: RemovalFault,
+        review: Option<&RemovalReview>,
+    ) -> Result<RemovalOutcome> {
         if self.lock.is_none() {
-            return self.locked()?.remove_sessions_staged(names, fault);
+            return self
+                .locked()?
+                .remove_sessions_with_review(names, fault, review);
         }
         let mut unique = HashSet::new();
         let sessions = names
             .iter()
-            .map(|name| {
+            .enumerate()
+            .map(|(index, name)| {
                 let metadata = self.load_session(name)?;
                 if !unique.insert(metadata.name.clone()) {
                     bail!("duplicate removal target '{}'", metadata.name);
                 }
-                validate_workspace(&self.workspace_path(&metadata.name), &metadata)?;
+                if let Some(review) = review {
+                    anyhow::ensure!(
+                        review.sessions.get(index) == Some(&metadata)
+                            && review.workspaces.get(index)
+                                == Some(&snapshot_workspace(&self.workspace_path(&metadata.name))?),
+                        "workspace or session changed since confirmation; review deletion again"
+                    );
+                } else {
+                    validate_workspace(&self.workspace_path(&metadata.name), &metadata)?;
+                }
                 Ok(metadata)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -362,7 +455,7 @@ impl SessionStore {
         );
         let mut staged: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
         let stage_result = (|| -> Result<()> {
-            for metadata in &sessions {
+            for (index, metadata) in sessions.iter().enumerate() {
                 let file = self.session_file(&metadata.name);
                 let target = file.with_file_name(format!(".{}.{nonce}.remove", metadata.name));
                 fs::rename(&file, &target)?;
@@ -376,7 +469,14 @@ impl SessionStore {
                         workspace.with_file_name(format!(".{}.{nonce}.remove", metadata.name));
                     fs::rename(&workspace, &target)?;
                     staged.push((workspace, target.clone(), true));
-                    validate_workspace(&target, metadata)?;
+                    if let Some(review) = review {
+                        anyhow::ensure!(
+                            review.workspaces.get(index) == Some(&snapshot_workspace(&target)?),
+                            "workspace changed during removal; review deletion again"
+                        );
+                    } else {
+                        validate_workspace(&target, metadata)?;
+                    }
                     if fault.stage == Some(staged.len()) {
                         bail!("injected staging failure");
                     }
@@ -1116,6 +1216,53 @@ fn current_timestamp() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn snapshot_workspace(workspace: &Path) -> Result<WorkspaceSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::symlink_metadata(workspace) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceSnapshot::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "workspace path is not a managed directory: {}",
+        workspace.display()
+    );
+    let mut snapshot = WorkspaceSnapshot {
+        identity: Some((metadata.dev(), metadata.ino())),
+        ..WorkspaceSnapshot::default()
+    };
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        for entry in fs::read_dir(workspace.join(&relative))? {
+            let entry = entry?;
+            let relative = relative.join(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            snapshot.entries.insert(
+                relative.clone(),
+                EntryStamp {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    mode: metadata.mode(),
+                    len: metadata.len(),
+                    modified: (metadata.mtime(), metadata.mtime_nsec()),
+                    changed: (metadata.ctime(), metadata.ctime_nsec()),
+                },
+            );
+            anyhow::ensure!(
+                snapshot.entries.len() <= 100_000,
+                "workspace is too large to review safely"
+            );
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push(relative);
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
 fn validate_workspace(workspace: &Path, session: &SessionMetadata) -> Result<()> {
     let metadata = match fs::symlink_metadata(workspace) {
         Ok(metadata) => metadata,
@@ -1176,6 +1323,80 @@ fn create_symlink(_target: &Path, _link: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reviewed_cleanup_removes_extra_trees_but_preserves_symlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("keep"), "source").unwrap();
+        let store = super::SessionStore::new(crate::config::DynwsPaths::from_home(
+            temp.path().join(".dynws"),
+        ));
+        store
+            .create_session("one", std::slice::from_ref(&repo), None, true)
+            .unwrap();
+        let workspace = store.workspace_path("one");
+        std::fs::create_dir(workspace.join("reports")).unwrap();
+        std::fs::write(workspace.join("reports/report.html"), "report").unwrap();
+        std::os::unix::fs::symlink(&repo, workspace.join("reports/external")).unwrap();
+        assert!(store.remove_sessions(&["one".into()]).is_err());
+        let review = store.review_removal(&["one".into()]).unwrap();
+        assert_eq!(review.extra_paths, vec![workspace.join("reports")]);
+        let result = store.remove_reviewed_sessions(&review).unwrap();
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(!workspace.exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("keep")).unwrap(),
+            "source"
+        );
+    }
+
+    #[test]
+    fn reviewed_cleanup_rejects_changed_files_for_the_whole_batch_and_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let store = super::SessionStore::new(crate::config::DynwsPaths::from_home(
+            temp.path().join(".dynws"),
+        ));
+        let names: Vec<String> = vec!["one".into(), "two".into()];
+        for name in &names {
+            store
+                .create_session(name, std::slice::from_ref(&repo), None, true)
+                .unwrap();
+        }
+        let extra = store.workspace_path("two").join("notes");
+        std::fs::write(&extra, "old").unwrap();
+        let review = store.review_removal(&names).unwrap();
+        std::fs::write(&extra, "new contents").unwrap();
+        assert!(
+            store
+                .remove_reviewed_sessions(&review)
+                .unwrap_err()
+                .to_string()
+                .contains("changed since confirmation")
+        );
+        for name in &names {
+            assert!(store.load_session(name).is_ok());
+        }
+        let review = store.review_removal(&names).unwrap();
+        assert!(
+            store
+                .remove_sessions_with_review(
+                    &names,
+                    super::RemovalFault {
+                        stage: Some(4),
+                        cleanup: false
+                    },
+                    Some(&review)
+                )
+                .is_err()
+        );
+        for name in &names {
+            assert!(store.load_session(name).is_ok());
+        }
+        assert_eq!(std::fs::read_to_string(extra).unwrap(), "new contents");
+    }
     #[test]
     fn bulk_removal_preflights_every_target_and_rolls_back_staging() {
         let temp = tempfile::tempdir().unwrap();

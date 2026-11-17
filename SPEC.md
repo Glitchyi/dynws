@@ -295,7 +295,13 @@ from a stale Open with dialog are rejected before launch.
 Dialogs use a bounded centered surface when space allows and the available
 content region otherwise. They clear underlying content, retain complete
 scrollable consequences/targets, and emphasize cancellation. Existing confirmation
-and mutation semantics are unchanged. Visible busy feedback precedes expensive
+and mutation semantics remain conservative by default. Session deletion with
+extra workspace entries requires a second confirmation listing those paths:
+d deletes the sessions and extra files/folders, while Enter/Esc/n cancels the
+whole batch. Symlink targets and source repositories are kept. The reviewed
+filesystem snapshot is revalidated before removal; changes require a new review.
+Interactive CLI removal requires typing delete; noninteractive removal refuses
+extra files. Visible busy feedback precedes expensive
 work. Fetching remains cancellable and accepts source-list navigation/filtering,
 while selection/publication actions are blocked until it completes. Rendering
 and resize handling perform no discovery, filesystem checks or Git polling.

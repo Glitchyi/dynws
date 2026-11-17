@@ -177,7 +177,7 @@ fn run_session_manager_app(
                     | (
                         SessionManagerMode::ConfirmRemoveSessions { .. }
                             | SessionManagerMode::ConfirmRemoveRepo { .. },
-                        KeyCode::Char('y')
+                        KeyCode::Char('y' | 'd')
                     )
             )
         {
@@ -1929,6 +1929,7 @@ fn save_open_preferences(paths: &DynwsPaths, dialog: &OpenDialog, confirmed: boo
 }
 
 struct SessionManagerApp {
+    removal_review: Option<crate::session::RemovalReview>,
     requested_editor: Option<(String, String)>,
     open_dialog: Option<OpenDialog>,
     opening: Option<Receiver<Result<String>>>,
@@ -2248,6 +2249,7 @@ impl SessionManagerApp {
     fn new(sessions: Vec<SessionMetadata>, store: SessionStore) -> Self {
         let present_paths = present_paths(&sessions);
         Self {
+            removal_review: None,
             requested_editor: None,
             open_dialog: None,
             opening: None,
@@ -2305,6 +2307,7 @@ impl SessionManagerApp {
                 "Enter Open  Ctrl+O Open with  Ctrl+T T3 Code  Ctrl+A Add  Ctrl+D Remove link  Esc Back".to_string()
             }
             SessionManagerMode::Rename { .. } => "Enter Save  Esc Cancel".to_string(),
+            SessionManagerMode::ConfirmRemoveSessions { .. } if self.removal_review.is_some() => "Enter Cancel  d Delete all".to_string(),
             _ => "Enter Cancel  y Confirm".to_string(),
         };
         let status = if let Some(session) = self.active_session() {
@@ -2473,10 +2476,21 @@ impl SessionManagerApp {
         let confirm = key_event(KeyCode::Char('y'), KeyModifiers::NONE);
         match &self.mode {
             SessionManagerMode::ConfirmRemoveSessions { session_names } => {
-                let text = self.removal_text(session_names);
-                let title = match session_names.as_slice() {
-                    [name] => format!("Delete {name}?"),
-                    names => format!("Delete {} sessions?", names.len()),
+                let mut text = self.removal_text(session_names);
+                let files = self.removal_review.as_ref();
+                if let Some(review) = files {
+                    text.push_str("\n\n# Also permanently deletes\nFolders include all their contents. Symlink targets are kept.");
+                    for path in &review.extra_paths {
+                        text.push_str(&format!("\n{}", path.display()));
+                    }
+                }
+                let title = if files.is_some() {
+                    "Delete workspace files too?".into()
+                } else {
+                    match session_names.as_slice() {
+                        [name] => format!("Delete {name}?"),
+                        names => format!("Delete {} sessions?", names.len()),
+                    }
                 };
                 self.view.text_dialog(
                     frame,
@@ -2493,12 +2507,23 @@ impl SessionManagerApp {
                         },
                         Button {
                             icon: "✕",
-                            label: "Delete",
-                            key: "y",
+                            label: if files.is_some() {
+                                "Delete all"
+                            } else {
+                                "Delete"
+                            },
+                            key: if files.is_some() { "d" } else { "y" },
                             strong: false,
                         },
                     ],
-                    &[cancel, confirm],
+                    &[
+                        cancel,
+                        if files.is_some() {
+                            key_event(KeyCode::Char('d'), KeyModifiers::NONE)
+                        } else {
+                            confirm
+                        },
+                    ],
                     "enter cancels",
                 );
             }
@@ -3192,48 +3217,72 @@ impl SessionManagerApp {
     ) -> SessionManagerSignal {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n') => {
+                self.removal_review = None;
                 self.mode = SessionManagerMode::Browse;
                 self.message = "remove cancelled".to_string();
             }
-            KeyCode::Char('y') => {
-                let outcome = match self.mutate(&session_names, |store| {
-                    store.remove_sessions(&session_names)
-                }) {
-                    Ok(outcome) => outcome,
+            KeyCode::Char('y') if self.removal_review.is_none() => {
+                match self.mutate(&session_names, |store| store.review_removal(&session_names)) {
+                    Ok(review) if !review.extra_paths.is_empty() => {
+                        self.removal_review = Some(review);
+                        self.view.scroll = 0;
+                        self.message.clear();
+                        return SessionManagerSignal::Continue;
+                    }
+                    Ok(_) => return self.finish_remove_sessions(session_names, None),
                     Err(error) => {
                         self.message = format!("Error: {error:#}");
                         self.mode = SessionManagerMode::Browse;
-                        return SessionManagerSignal::Continue;
                     }
-                };
-                let removed_count = outcome.sessions.len();
-                for removed in outcome.sessions {
-                    self.sessions.retain(|session| session.name != removed.name);
-                    self.selected.remove(&removed.name);
-                    self.changes
-                        .push(format!("removed session {}", removed.name));
                 }
-                let warnings = outcome.warnings.join("; ");
-                let len = self.filtered_indices().len();
-                if self.cursor >= len {
-                    self.cursor = len.saturating_sub(1);
-                }
-                self.message = format!(
-                    "removed {}{}",
-                    count_label(removed_count, "session", "sessions"),
-                    if warnings.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; Warning: {warnings}")
-                    }
-                );
-                self.mode = SessionManagerMode::Browse;
             }
-            _ => {
-                self.view.scroll = 0;
-                self.mode = SessionManagerMode::ConfirmRemoveSessions { session_names };
+            KeyCode::Char('d') if self.removal_review.is_some() => {
+                let review = self.removal_review.take();
+                return self.finish_remove_sessions(session_names, review);
             }
+            _ => {}
         }
+        SessionManagerSignal::Continue
+    }
+
+    fn finish_remove_sessions(
+        &mut self,
+        session_names: Vec<String>,
+        review: Option<crate::session::RemovalReview>,
+    ) -> SessionManagerSignal {
+        let outcome = match self.mutate(&session_names, |store| match &review {
+            Some(review) => store.remove_reviewed_sessions(review),
+            None => store.remove_sessions(&session_names),
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.message = format!("Error: {error:#}");
+                self.mode = SessionManagerMode::Browse;
+                return SessionManagerSignal::Continue;
+            }
+        };
+        let removed_count = outcome.sessions.len();
+        for removed in outcome.sessions {
+            self.sessions.retain(|session| session.name != removed.name);
+            self.selected.remove(&removed.name);
+            self.changes
+                .push(format!("removed session {}", removed.name));
+        }
+        let warnings = outcome.warnings.join("; ");
+        let len = self.filtered_indices().len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
+        }
+        self.message = format!(
+            "removed {}{}",
+            count_label(removed_count, "session", "sessions"),
+            if warnings.is_empty() {
+                String::new()
+            } else {
+                format!("; Warning: {warnings}")
+            }
+        );
+        self.mode = SessionManagerMode::Browse;
         SessionManagerSignal::Continue
     }
 
@@ -3356,6 +3405,7 @@ impl SessionManagerApp {
     }
 
     fn start_remove(&mut self) {
+        self.removal_review = None;
         let session_names = self.target_session_names();
         if session_names.is_empty() {
             self.message = "no matching session".to_string();
@@ -3811,7 +3861,7 @@ impl View {
         for action in hints.split("  ").filter(|action| !action.is_empty()) {
             let (shortcut, label) = action.split_once(' ').unwrap_or((action, ""));
             if let Some(key) = action_key(shortcut)
-                && key.code != KeyCode::Char('y')
+                && !(key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('y' | 'd')))
                 && !self.commands.iter().any(|command| command.key == key)
             {
                 self.commands.push(PaletteCommand {
@@ -5531,10 +5581,41 @@ Double-click: Open the highlighted session
 Wheel: Scroll
 
 Deleting confirms the exact targets; Enter, Esc or n cancels.
+Extra workspace files require a second review; d confirms deleting those too.
 Deleting a session keeps source repositories and managed worktrees.";
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extra_files_need_a_separate_confirmation_and_cancel_keeps_everything() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let store = SessionStore::new(DynwsPaths::from_home(temp.path().join(".dynws")));
+        store
+            .create_session("cleanup", std::slice::from_ref(&repo), None, true)
+            .unwrap();
+        let file = store.workspace_path("cleanup").join("report.html");
+        std::fs::write(&file, "report").unwrap();
+        let mut app = SessionManagerApp::new(store.load_sessions().unwrap(), store.clone());
+        app.start_remove();
+        app.handle_key(key_event(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.removal_review.is_some());
+        app.handle_key(key_event(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(file.exists());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(buffer_text(&terminal).contains("Delete workspace files too?"));
+        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(file.exists());
+        assert!(app.removal_review.is_none());
+        app.start_remove();
+        app.handle_key(key_event(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_key(key_event(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(!file.exists());
+        assert!(repo.exists());
+        assert!(app.sessions.is_empty());
+    }
     use super::*;
     use crate::git::GitRepoStatus;
     use ratatui::style::Modifier;

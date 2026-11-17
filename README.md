@@ -324,6 +324,15 @@ locked, shared, legacy-unverified, and external worktrees are preserved; when
 Git refuses cleanup, `dws` reports the retained path. Normal linked repositories
 and source repositories are never deleted.
 
+When deleting sessions containing extra workspace files or folders, dws lists
+those paths in a second **Delete workspace files too?** dialog. Press **d** to
+permanently delete them along with the sessions; **Enter**, **Esc** or **n**
+cancels the entire removal. Folders include their contents; symlink targets,
+source repositories and managed worktrees are kept. If the workspace changes
+after review, deletion is refused and must be reviewed again. The interactive
+`dws remove SESSION` command asks you to type `delete`; noninteractive removal
+continues to refuse extra files.
+
 ## Configuration
 
 ```sh
