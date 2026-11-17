@@ -52,7 +52,9 @@ invalid project state produces an error and is never created implicitly.
 ## Session manager and guided creation
 
 Run `dws` anywhere inside an initialized collection to manage existing sessions.
-The empty home screen offers **Ctrl+N New session**. Create directly with:
+It opens on the launcher: a search field, large **New session**, **All sessions**
+and **Commands** buttons, and your sessions with the most recently updated
+first. An empty collection offers **Ctrl+N New session**. Create directly with:
 
 ```sh
 dws new
@@ -205,13 +207,17 @@ go to stderr; errors exit nonzero without a success document.
 
 ## Manage sessions
 
-In the home screen, type to filter and use the arrow keys to move. **Enter**
+In the launcher, type to filter and use the arrow keys to move. **Enter**
 closes the manager and opens the highlighted session, even when other sessions
-are selected. **Right** displays repositories; **Left/Escape** returns.
+are selected. **Tab** switches to the full session list with a details sidebar.
+**Right** displays repositories; **Left/Escape** returns. New sessions are built
+in a dialog that previews the workspace, links and worktree paths before
+anything is written.
 
 | Key | Action |
 | --- | --- |
 | Ctrl+N | Create a new session |
+| Tab | Switch between the launcher and all sessions |
 | Ctrl+S | Toggle session selection |
 | Ctrl+E | Rename one selected session, or the highlighted session |
 | Ctrl+D | Delete selected sessions, or remove a repository link when expanded |
@@ -276,6 +282,18 @@ eval "$(DWS_COMPLETE=bash dws)"
 Generate the hook each shell startup: the pinned completion engine uses a
 versioned, unstable integration protocol. No shell configuration is edited by dws.
 
+`dws shell-init zsh` (or `bash`) prints the same completion hook plus a small
+`dws` shell function, which is needed for `cd` below. Use it instead of the line
+above:
+
+```zsh
+eval "$(dws shell-init zsh)"     # ~/.zshrc
+```
+
+```bash
+eval "$(dws shell-init bash)"    # ~/.bashrc
+```
+
 ## Migrating the command layout
 
 | Previous invocation | Replacement |
@@ -319,6 +337,42 @@ dws config clear file-manager
 An explicit editor command takes precedence over the saved default. Neither
 `EDITOR`/`VISUAL` nor a supported-editor catalog is consulted. The saved file
 manager command is used by `dws reveal`; platform detection remains the fallback.
+
+### Opening sessions
+
+Press **Ctrl+O** in the launcher or session list to choose your configured editor
+(Cursor when unset), T3 Code, or Finder (the configured desktop file manager on
+Linux). Use **1–3** or arrow keys to choose, **Space** to remember that opener
+for every session, and **Enter** to open. **Ctrl+T** opens directly in T3 Code;
+both actions are also in the command palette.
+
+The first T3 open shows the exact command and requires **y**; Enter cancels.
+It uses `~/.t3/bin/t3 app <workspace>`, which creates a missing project and
+opens it in the running desktop app. It never writes T3's database directly.
+Errors stay visible; **F2** shows the command and output. Install T3's CLI from
+the desktop app first. The app must be running and its local environment connected.
+
+```sh
+dws config set opener t3       # explicitly confirm T3 and make it the default
+dws config set opener editor   # use your editor again
+dws config clear opener        # restore the default editor behavior
+```
+
+The saved opener also applies to `dws open` and newly created interactive
+sessions. An explicit `--editor` overrides it for that invocation.
+
+By default dws starts the editor and waits for it, as a terminal editor needs.
+Two switches change that for GUI editors such as Cursor:
+
+```sh
+dws config set background on   # start the editor detached; the shell is free at once
+dws config set cd on           # move the shell into the workspace after opening
+dws config clear background    # back to waiting
+```
+
+`cd` needs the shell function from `dws shell-init`: a program cannot change its
+parent shell's directory, so dws writes the workspace path to a file the
+function reads after dws exits. Without the function, dws prints how to add it.
 
 ## Project data
 

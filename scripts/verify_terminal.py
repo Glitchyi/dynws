@@ -132,11 +132,12 @@ class Terminal:
         `word` skips matches inside longer words (such as "esc" in "Description");
         `in_list` only matches list rows, which carry a selection marker."""
         self.read()
-        markers = "○●◆"
+        markers = "○●◆✕"
         for row, cells in enumerate(self.screen.lines):
             line = "".join(cells)
             match = re.search(rf"(?<!\w){re.escape(text)}(?!\w)" if word else re.escape(text), line)
-            marker = next((line.index(m) for m in markers if m in line), None)
+            # A list item's marker sits two columns before its name.
+            marker = match.start() - 2 if match and match.start() >= 2 and line[match.start() - 2] in markers else None
             if match and (not (checkbox or in_list) or marker is not None):
                 col = marker if checkbox else match.start()
                 for _ in range(count):
@@ -188,6 +189,116 @@ def create(root, env, name, repo="api"):
     return run(root, env, "create", "--file", str(file)).strip()
 
 
+def capture(term, name):
+    destination = os.environ.get("DWS_CAPTURE_DIR")
+    if destination:
+        path = Path(destination)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{name}.json").write_text(json.dumps({"width":term.screen.width, "height":term.screen.height, "lines":term.screen.lines}))
+
+
+def open_with_tests(root, env):
+    """Exercise the real TUI and CLI against a disposable T3 subprocess."""
+    env = dict(env)
+    home = root / "fake-home"
+    binary = home / ".t3/bin/t3"
+    binary.parent.mkdir(parents=True)
+    record = root / "t3-calls.jsonl"
+    fail = root / "t3-fail"
+    binary.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+                      f"record=Path({str(record)!r}); fail=Path({str(fail)!r})\n"
+                      "with record.open('a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                      "if fail.exists(): print('T3 test failure: desktop unavailable',file=sys.stderr); sys.exit(7)\n"
+                      )
+    binary.chmod(0o755)
+    env["HOME"] = str(home)
+    term = Terminal([str(BINARY)], root, env)
+    try:
+        term.expect("Open a session")
+        term.send(b"\x0f")
+        term.expect("Choose where to open")
+        for width, height in [(40,12), (60,16), (80,24), (120,40)]:
+            term.resize(width, height)
+            term.read(0.15)
+            visible = term.screen.text()
+            assert "T3 Code" in visible and "Finder" in visible and "Cancel" in visible and "Open" in visible, visible
+            capture(term, f"open-with-{width}")
+        term.send("2\r")
+        term.expect("in T3 Code")
+        term.expect(" app ")
+        term.send(b"\r")  # Enter cancels the first-use confirmation.
+        term.expect("Choose where to open")
+        assert not record.exists()
+        term.send(b" \r")  # remember, then confirm
+        term.expect("in T3 Code")
+        term.send("y")
+        term.expect("Opened api-review")
+        calls = [json.loads(line) for line in record.read_text().splitlines()]
+        assert calls == [["app",str(root / ".dynws/workspaces/api-review")]], calls
+        config = (root / ".dynws/config.toml").read_text()
+        assert 'opener = "t3"' in config and "t3_confirmed = true" in config
+        term.send(b"\x03")
+        term.finish()
+    finally:
+        term.close()
+    # Repeat opening runs the same single command, without preregistration.
+    run(root, env, "open", "api-review")
+    calls = [json.loads(line) for line in record.read_text().splitlines()]
+    assert len(calls) == 2 and calls[-1][0] == "app", calls
+    fail.touch()
+    term = Terminal([str(BINARY)], root, env)
+    try:
+        term.expect("Open a session")
+        term.send(b"\x14")  # direct T3 command
+        term.expect("Could not open session")
+        term.send(b"\x1bOQ")  # F2: full stderr
+        term.expect("desktop unavailable")
+        capture(term, "open-with-error")
+        term.send(b"\x03")
+        term.finish()
+    finally:
+        term.close()
+    assert len(record.read_text().splitlines()) == 3
+    binary.unlink()
+    term = Terminal([str(BINARY)], root, env)
+    try:
+        term.expect("Open a session")
+        term.send(b"\x14")
+        term.expect("Could not open session")
+        term.send(b"\x1bOQ")
+        term.expect("CLI is missing")
+        term.send(b"\x03")
+        term.finish()
+    finally:
+        term.close()
+    run(root, env, "config", "clear", "opener")
+    manager = root / "fake-file-manager"
+    revealed = root / "revealed-path"
+    manager.write_text(f"#!/bin/sh\nprintf '%s' \"$1\" > {shlex.quote(str(revealed))}\n")
+    manager.chmod(0o755)
+    run(root, env, "config", "set", "file-manager", str(manager))
+    term = Terminal([str(BINARY)], root, env)
+    try:
+        term.expect("Open a session")
+        term.send(b"\x0f")
+        term.expect("Choose where to open")
+        term.click_text("Finder")
+        term.click_text("Use this choice")
+        term.send(b"\r")
+        term.expect("Opened api-review")
+        assert revealed.read_text() == str(root / ".dynws/workspaces/api-review")
+        assert 'opener = "finder"' in (root / ".dynws/config.toml").read_text()
+        term.send(b"\x03")
+        term.finish()
+    finally:
+        term.close()
+    run(root, env, "config", "set", "opener", "t3")
+    # --editor overrides even a saved T3 default with a missing T3 binary.
+    run(root, env, "open", "api-review", "--editor", str(manager))
+    run(root, env, "config", "clear", "opener")
+    run(root, env, "config", "clear", "file-manager")
+
+
 def terminal_tests(root, env):
     editor = root / "editor with spaces"
     record = root / "editor.json"
@@ -200,7 +311,7 @@ def terminal_tests(root, env):
     run(root, env, "config", "set", "editor", f'"{editor}" "two words"')
     term = Terminal([str(BINARY)], root, env)
     try:
-        term.expect("Sessions")
+        term.expect("Open a session")
         term.send(b"\x0e")  # Ctrl+N enters shared create flow.
         term.expect("New session")
         term.send(b"\x1b")
@@ -223,11 +334,15 @@ def terminal_tests(root, env):
                 assert "Resize to 40" in visible, (width, height, visible)
             else:
                 assert "api-review" in visible and "1 selected" in visible, (width, height, visible)
+                launcher = width >= 60 and height >= 20
+                assert ("Open a session" in visible) == launcher, (width, height, visible)
                 sidebar = re.search(r"dynws \d", visible) is not None
-                assert sidebar == (width >= 100 and height >= 20), (width, height, visible)
+                assert sidebar == (width >= 100 and height >= 20 and not launcher), (width, height, visible)
         term.send(b"\x1b")  # Clear filter; preserve highlighted session and bulk selection.
         term.read(0.1)
-        term.send(b"\r")  # Open highlighted session after terminal teardown.
+        term.send(b"\x0f")
+        term.expect("Choose where to open")
+        term.send(b"\r")  # Chosen terminal editor opens after terminal teardown.
         term.expect("EDITOR_STARTED")
         term.finish()
         data = json.loads(record.read_text())
@@ -242,7 +357,7 @@ def terminal_tests(root, env):
         term.expect("New session")
         term.send("extra")
         term.send(b"\x13\r")
-        term.expect("Name session")
+        term.expect("Letters, numbers and dashes")
         term.send("ui-created\r")
         term.finish()
         assert (root / ".dynws/sessions/ui-created.toml").is_file()
@@ -250,15 +365,15 @@ def terminal_tests(root, env):
         term.close()
     term = Terminal([str(BINARY)], root, env)
     try:
-        term.expect("Sessions")
+        term.expect("Open a session")
         term.send("ui-created")
         term.send(b"\x05")  # Ctrl+E rename
-        term.expect("Rename session")
+        term.expect("Rename ui-created")
         term.send(b"\x7f" * len("ui-created") + b"ui-renamed\r")
         term.expect("renamed ui-created")
         term.send("ui-renamed")
         term.send(b"\x04")
-        term.expect("Delete session")
+        term.expect("Delete ui-renamed?")
         term.send(b"\r")  # Enter cancels by default.
         term.expect("remove cancelled")
         assert (root / ".dynws/sessions/ui-renamed.toml").is_file()
@@ -276,21 +391,21 @@ def terminal_tests(root, env):
 def mouse_tests(root, env):
     term = Terminal([str(BINARY)], root, env, width=120, height=40)
     try:
-        term.expect("Sessions")
+        term.expect("Open a session")
         term.send(b"\x10")
         term.expect("Commands")
         term.send("repositories")
         term.send(b"\x1b")
         term.read()
         # Palette search text never leaks into the session filter.
-        assert "Type to filter sessions" in term.screen.text()
+        assert "Search by name, repository or branch" in term.screen.text()
         term.click_text("api-review", checkbox=True)
         term.expect("1 selected")
         term.click_text("ctrl+p")
         term.expect("Commands")
         term.send("delete")
         term.click_text("Delete sessions")
-        term.expect("Delete session")
+        term.expect("Delete api-review?")
         term.read(0.4)  # A distinct click, outside the action coalescing interval.
         term.click_text("Cancel", word=True)
         term.expect("remove cancelled")
@@ -300,9 +415,9 @@ def mouse_tests(root, env):
         term.send("show repositories")
         term.click_text("Show repositories")
         term.expect("2 repositories")
-        term.click_text("worker")
+        term.click_text("worker", in_list=True)
         term.read(0.4)
-        term.click_text("f2 details")
+        term.click_text("f2", word=True)
         term.expect("Details")
         term.read(0.4)
         term.click_text("esc", word=True)
@@ -330,11 +445,11 @@ def mouse_tests(root, env):
         term.expect("folder-preview.txt")
         term.click_text("esc", word=True)
         term.click_text("extra", checkbox=True)
-        term.click_text("next", word=True)
-        term.expect("Name session")
+        term.click_text("Next", word=True)
+        term.expect("Letters, numbers and dashes")
         term.send("mouse-created")
         term.read(0.4)
-        term.click_text("create session")
+        term.click_text("Create session")
         term.finish()
         assert (root / ".dynws/sessions/mouse-created.toml").is_file()
     finally:
@@ -371,9 +486,9 @@ def worktree_workflow(root, env):
         term.send("-missing")  # Filtering continues without changing the pending selection.
         term.expect("No repositories match")
         term.send(b"\x7f" * len("-missing"))
-        term.expect("Choose branches")
+        term.expect("Filter branches")
         term.send("main\r")
-        term.expect("Name session")
+        term.expect("Letters, numbers and dashes")
         term.send("worktree-ui\r")
         term.finish()
         workspace = root / ".dynws/workspaces/worktree-ui/git-api"
@@ -435,6 +550,7 @@ def main():
         (root / "extra/folder-preview.txt").write_text("preview fixture")
         run(root, env, "init")
         create(root, env, "api-review")
+        open_with_tests(root, env)
         terminal_tests(root, env)
         mouse_tests(root, env)
         worktree_workflow(root, env)

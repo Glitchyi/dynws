@@ -656,3 +656,162 @@ fn live_completion_is_scoped_fresh_quiet_and_never_runs_git_or_writes() {
         .assert()
         .failure();
 }
+
+#[cfg(unix)]
+fn session_with_slow_editor(temp: &tempfile::TempDir) -> (std::path::PathBuf, String) {
+    init(temp.path());
+    let home = temp.path().join(".dynws");
+    fs::create_dir(home.join("workspaces/demo")).unwrap();
+    fs::write(
+        home.join("sessions/demo.toml"),
+        "name='demo'\nrepos=[]\ncreated_at='now'\nupdated_at='now'\n",
+    )
+    .unwrap();
+    let marker = temp.path().join("editor-finished");
+    let script = temp.path().join("slow-editor");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nsleep 2\nprintf done > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    (marker, format!("\"{}\"", script.display()))
+}
+
+#[cfg(unix)]
+#[test]
+fn background_open_returns_at_once_and_hands_the_workspace_to_the_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let (marker, editor) = session_with_slow_editor(&temp);
+    for (key, value, said) in [
+        ("background", "on", "background open on"),
+        ("cd", "yes", "cd into workspace on"),
+    ] {
+        dws()
+            .current_dir(temp.path())
+            .env_remove("DYNWS_HOME")
+            .args(["config", "set", key, value])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(said));
+    }
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .args(["config", "set", "cd", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expected on or off"));
+
+    let cd_file = temp.path().join("cd-target");
+    let started = std::time::Instant::now();
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .env("DWS_CD_FILE", &cd_file)
+        .args(["open", "demo", "--editor", &editor])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("in the background"));
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+    assert!(!marker.exists(), "dws waited for the editor");
+    let target = std::path::PathBuf::from(fs::read_to_string(&cd_file).unwrap());
+    assert_eq!(
+        target.canonicalize().unwrap(),
+        temp.path()
+            .join(".dynws/workspaces/demo")
+            .canonicalize()
+            .unwrap()
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline, "the editor never ran");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .env_remove("DWS_CD_FILE")
+        .args(["open", "demo", "--editor", &editor])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("dws shell-init"));
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .args(["config", "clear", "background"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("background open off"));
+    let config = fs::read_to_string(temp.path().join(".dynws/config.toml")).unwrap();
+    assert!(config.contains("cd = true") && !config.contains("background"));
+}
+
+#[test]
+fn shell_init_prints_a_cd_function_and_completion_without_a_project() {
+    let temp = tempfile::tempdir().unwrap();
+    for (shell, completion) in [
+        ("zsh", "source <(DWS_COMPLETE=zsh command dws)"),
+        ("bash", "eval \"$(DWS_COMPLETE=bash command dws)\""),
+    ] {
+        dws()
+            .current_dir(temp.path())
+            .env_remove("DYNWS_HOME")
+            .args(["shell-init", shell])
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("dws() {")
+                    .and(predicate::str::contains("DWS_CD_FILE"))
+                    .and(predicate::str::contains("cd -- \"$dws_target\""))
+                    .and(predicate::str::contains(completion)),
+            );
+    }
+    assert!(!temp.path().join(".dynws").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_function_moves_bash_into_the_opened_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, editor) = session_with_slow_editor(&temp);
+    for key in ["background", "cd"] {
+        dws()
+            .current_dir(temp.path())
+            .env_remove("DYNWS_HOME")
+            .args(["config", "set", key, "on"])
+            .assert()
+            .success();
+    }
+    let binary = assert_cmd::cargo::cargo_bin("dws");
+    let path = format!(
+        "{}:{}",
+        binary.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = std::process::Command::new("bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(format!(
+            "eval \"$(dws shell-init bash)\" && dws open demo --editor '{}' 2>/dev/null && pwd -P",
+            editor.replace('\'', "'\\''")
+        ))
+        .current_dir(temp.path())
+        .env("PATH", path)
+        .env_remove("DYNWS_HOME")
+        .env_remove("DWS_CD_FILE")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        temp.path()
+            .join(".dynws/workspaces/demo")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    );
+}

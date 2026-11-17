@@ -6,17 +6,40 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### OpenCode-style interface
+### Opening and the session list
 
-- Adopt OpenCode's default dark theme: near-black page, raised panels, an orange
-  focus bar, purple headings and lowercase key hints; `NO_COLOR` keeps reverse video.
-- Empty collections open on a centered "dynws" logo home with a creation tip.
-- Lists sit above a prompt box (filter input plus mode/status line) and a hint
-  line ending in `ctrl+p commands`; wide terminals add a raised details sidebar.
-- Help, details, rename, deletion and the categorized command palette are
-  centered dialogs over a dimmed backdrop; deletion keeps Cancel as the default.
-- Feedback appears as top-right toasts colored by outcome; branch-fetch progress
-  moves into the prompt status line. Session rows show their last update age.
+- Ctrl+O chooses your editor, T3 Code or the desktop file manager; Space saves
+  the choice. Ctrl+T opens T3 directly, with an exact-command confirmation on
+  first use and subprocess errors in F2. `config set opener` sets the default
+  for the CLI and new sessions too. T3 uses `t3 app` without preregistration.
+- `dws config set background on` starts the editor detached, so the terminal is
+  usable while a slow GUI editor launches; the default still waits.
+- `dws config set cd on` with `eval "$(dws shell-init zsh)"` (or `bash`) moves
+  the shell into the opened workspace; `shell-init` also installs completion.
+- The launcher shows the focused session as a card with its repositories,
+  description and clickable `enter open`, `→ repositories` and `ctrl+e rename`.
+- Session lists are grouped into Today, This week, This month and Earlier;
+  repository names are never cut (extra ones become `+N`), the age stays
+  visible, and the repeated workspace path is gone.
+
+### Launcher and guided creation
+
+- `dws` opens on a launcher: an animated constellation of your repositories and
+  sessions, a search field, large New session / All sessions / Commands buttons
+  and two-row session items, most recently updated first. Tab switches to the
+  full list with a details sidebar.
+- New and Add run in one dialog over the screen they came from: a stepper,
+  repositories grouped by folder, and a "Will create" preview of the workspace,
+  link and worktree paths before anything is written.
+- A monochrome slate theme: labelled bordered fields, three-row buttons and
+  two-row list items give larger click targets; focus is reverse contrast and
+  state uses shapes and words (● link, ◆ worktree, ✕ missing).
+- Delete, remove, rename, help, details and the grouped command palette are
+  dialogs over a dimmed backdrop; deletion lists what it deletes and keeps, and
+  Enter still cancels. Feedback appears as bordered toasts that never cover
+  status or inputs.
+- The signature animates only while the launcher is idle and holds still under
+  `NO_COLOR` or `DWS_REDUCE_MOTION=1`.
 
 ### Responsive terminal presentation
 

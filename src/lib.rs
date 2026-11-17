@@ -6,12 +6,15 @@ mod discovery;
 mod editor;
 mod git;
 mod manifest;
+mod opener;
 mod session;
 mod tui;
 
-use crate::cli::{Cli, Commands, ConfigCommands, ConfigKey};
+use crate::cli::{Cli, Commands, ConfigCommands, ConfigKey, Shell};
 use crate::config::{Config, DynwsPaths};
-use crate::editor::{detect_file_managers, launch, resolve_editor, resolve_file_manager};
+use crate::editor::{
+    detect_file_managers, launch, launch_detached, resolve_editor, resolve_file_manager,
+};
 use crate::session::{SessionPatch, SessionStore};
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
@@ -23,6 +26,10 @@ pub fn run() -> Result<()> {
         .var("DWS_COMPLETE")
         .complete();
     let Cli { command } = Cli::parse();
+    if let Some(Commands::ShellInit { shell }) = command {
+        print!("{}", shell_init(shell));
+        return Ok(());
+    }
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     if matches!(command, Some(Commands::Init)) {
         let paths = DynwsPaths::initialize_from(&cwd)?;
@@ -74,7 +81,7 @@ pub fn run() -> Result<()> {
                 eprintln!("{change}");
             }
             if let Some(session) = outcome.open_session {
-                open_session(&paths, &session, None)?;
+                open_session(&paths, &session, outcome.editor.as_deref())?;
             }
         }
         Some(Commands::New { editor, no_open }) => {
@@ -147,7 +154,9 @@ pub fn run() -> Result<()> {
             );
         }
         Some(Commands::Config { command }) => configure(&paths, command)?,
-        Some(Commands::Init | Commands::Create { .. }) => unreachable!("handled before dispatch"),
+        Some(Commands::Init | Commands::Create { .. } | Commands::ShellInit { .. }) => {
+            unreachable!("handled before dispatch")
+        }
     }
     Ok(())
 }
@@ -161,15 +170,110 @@ fn require_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Opens a session in the editor: in the foreground (waiting, as before) or,
+/// with `open.background`, detached so the shell is free at once. With
+/// `open.cd`, the workspace path is handed to the `dws shell-init` function,
+/// which moves the shell there after dws exits.
 fn open_session(paths: &DynwsPaths, name: &str, explicit: Option<&str>) -> Result<()> {
     let store = SessionStore::new(paths.clone());
     let metadata = store.load_session(name)?;
     let config = Config::load(paths)?;
-    let selected = resolve_editor(explicit, config.editor.default.as_deref())?;
-    launch(&selected, &store.workspace_path(&metadata.name), true)
+    if explicit.is_none()
+        && config
+            .open
+            .opener
+            .is_some_and(|opener| opener != opener::Opener::Editor)
+    {
+        let opener = config.open.opener.expect("checked above");
+        if opener == opener::Opener::T3 && !config.open.t3_confirmed {
+            bail!(
+                "T3 Code needs first-use confirmation; open dws and choose Ctrl+O, or confirm with 'dws config set opener t3'"
+            );
+        }
+        let workspace = store.workspace_path(&metadata.name);
+        opener::OpenPlan::new(opener, &config, &workspace, None)?.run()?;
+        if config.open.cd {
+            request_cd(&workspace);
+        }
+        return Ok(());
+    }
+    let selected = resolve_editor(
+        explicit,
+        config
+            .editor
+            .default
+            .as_deref()
+            .or(Some("cursor --new-window")),
+    )?;
+    let workspace = store.workspace_path(&metadata.name);
+    if config.open.cd {
+        request_cd(&workspace);
+    }
+    if config.open.background {
+        launch_detached(&selected, &workspace)?;
+        eprintln!(
+            "opened {} with {} in the background",
+            metadata.name,
+            selected.command_line()
+        );
+        Ok(())
+    } else {
+        launch(&selected, &workspace, true)
+    }
+}
+
+/// The shell function writes this file's contents to `cd` after dws exits.
+const CD_FILE_ENV: &str = "DWS_CD_FILE";
+
+fn request_cd(workspace: &std::path::Path) {
+    match std::env::var_os(CD_FILE_ENV) {
+        Some(file) if !file.is_empty() => {
+            if let Err(error) = std::fs::write(&file, workspace.as_os_str().as_encoded_bytes()) {
+                eprintln!("warning: could not hand the workspace to your shell: {error}");
+            }
+        }
+        _ => eprintln!(
+            "note: to cd into workspaces, add `eval \"$(dws shell-init zsh)\"` to ~/.zshrc (or `bash` to ~/.bashrc)"
+        ),
+    }
+}
+
+/// Shell integration: a `dws` function that runs the binary with a temporary
+/// cd file and moves into the path it leaves behind, plus completion.
+fn shell_init(shell: Shell) -> String {
+    let completion = match shell {
+        Shell::Zsh => "source <(DWS_COMPLETE=zsh command dws)",
+        Shell::Bash => "eval \"$(DWS_COMPLETE=bash command dws)\"",
+    };
+    format!(
+        r#"# dws shell integration ({name})
+dws() {{
+  local dws_cd_file dws_status dws_target
+  dws_cd_file="$(mktemp "${{TMPDIR:-/tmp}}/dws-cd.XXXXXX")" || return
+  DWS_CD_FILE="$dws_cd_file" command dws "$@"
+  dws_status=$?
+  if [ -s "$dws_cd_file" ]; then
+    dws_target="$(cat "$dws_cd_file")"
+    [ -d "$dws_target" ] && cd -- "$dws_target"
+  fi
+  rm -f -- "$dws_cd_file"
+  return $dws_status
+}}
+{completion}
+"#,
+        name = match shell {
+            Shell::Zsh => "zsh",
+            Shell::Bash => "bash",
+        }
+    )
 }
 
 fn configure(paths: &DynwsPaths, command: ConfigCommands) -> Result<()> {
+    let _lock = if matches!(command, ConfigCommands::List { .. }) {
+        None
+    } else {
+        Some(paths.mutation_lock()?)
+    };
     let mut config = Config::load(paths)?;
     match command {
         ConfigCommands::List { .. } => {
@@ -188,18 +292,58 @@ fn configure(paths: &DynwsPaths, command: ConfigCommands) -> Result<()> {
             }
         }
         ConfigCommands::Set { key, command } => {
+            if matches!(key, ConfigKey::Opener) {
+                let opener = opener::Opener::parse(&command)?;
+                config.open.opener = Some(opener);
+                if opener == opener::Opener::T3 {
+                    config.open.t3_confirmed = true;
+                }
+                config.save(paths)?;
+                println!("default opener set to {command}");
+                return Ok(());
+            }
+            if let Some(flag) = switch(&mut config, key) {
+                *flag = parse_switch(&command)?;
+                config.save(paths)?;
+                println!(
+                    "{} {}",
+                    key.label(),
+                    if *switch(&mut config, key).expect("switch key") {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                return Ok(());
+            }
             let selected = match key {
                 ConfigKey::Editor => resolve_editor(Some(&command), None)?,
                 ConfigKey::FileManager => {
                     resolve_file_manager(Some(&command), None, &detect_file_managers())?
                 }
+                ConfigKey::Background | ConfigKey::Cd | ConfigKey::Opener => {
+                    unreachable!("handled above")
+                }
             };
-            *setting(&mut config, key) = Some(selected.command_line());
+            *setting(&mut config, key).expect("command key") = Some(selected.command_line());
             config.save(paths)?;
             println!("default {} set to {}", key.label(), selected.command_line());
         }
         ConfigCommands::Clear { key } => {
-            if setting(&mut config, key).take().is_none() {
+            if matches!(key, ConfigKey::Opener) {
+                config.open.opener = None;
+                config.save(paths)?;
+                println!("default opener cleared");
+                return Ok(());
+            }
+            if let Some(flag) = switch(&mut config, key) {
+                if std::mem::take(flag) {
+                    config.save(paths)?;
+                }
+                println!("{} off", key.label());
+                return Ok(());
+            }
+            if setting(&mut config, key).and_then(Option::take).is_none() {
                 println!("default {} already unset", key.label());
             } else {
                 config.save(paths)?;
@@ -210,18 +354,40 @@ fn configure(paths: &DynwsPaths, command: ConfigCommands) -> Result<()> {
     Ok(())
 }
 
-fn setting(config: &mut Config, key: ConfigKey) -> &mut Option<String> {
+/// The command-line settings; `None` for the on/off keys.
+fn setting(config: &mut Config, key: ConfigKey) -> Option<&mut Option<String>> {
     match key {
-        ConfigKey::Editor => &mut config.editor.default,
-        ConfigKey::FileManager => &mut config.file_manager.default,
+        ConfigKey::Editor => Some(&mut config.editor.default),
+        ConfigKey::FileManager => Some(&mut config.file_manager.default),
+        ConfigKey::Background | ConfigKey::Cd | ConfigKey::Opener => None,
+    }
+}
+
+/// The on/off settings; `None` for keys that store a command line.
+fn switch(config: &mut Config, key: ConfigKey) -> Option<&mut bool> {
+    match key {
+        ConfigKey::Background => Some(&mut config.open.background),
+        ConfigKey::Cd => Some(&mut config.open.cd),
+        ConfigKey::Editor | ConfigKey::FileManager | ConfigKey::Opener => None,
+    }
+}
+
+fn parse_switch(value: &str) -> Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => bail!("expected on or off, got {other:?}"),
     }
 }
 
 impl ConfigKey {
     fn label(self) -> &'static str {
         match self {
+            Self::Opener => "opener",
             Self::Editor => "editor",
             Self::FileManager => "file manager",
+            Self::Background => "background open",
+            Self::Cd => "cd into workspace",
         }
     }
 }

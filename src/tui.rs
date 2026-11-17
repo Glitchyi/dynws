@@ -19,19 +19,21 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, ListState, Paragraph, Wrap};
 
 mod chrome;
 
 use chrome::{
-    Button, DIALOG_CHROME, LOGO_HEIGHT, LOGO_WIDTH, PromptBox, Theme, VERSION, age, brand_line,
-    clip, clip_line, clip_start, dialog, dialog_padding, dialog_width, draw_buttons, draw_field,
-    draw_prompt, draw_toast, logo_lines, prompt_height, wrap_lines,
+    Button, DialogFrame, Field, Scale, Theme, VERSION, age, alert, brand_line, button_width, clip,
+    clip_line, dialog, dialog_chrome, dialog_sized, dialog_width, draw_button, draw_field,
+    draw_toast, heading, keycap, stepper, wrap_lines,
 };
 
+use crate::config::Config;
 use crate::config::DynwsPaths;
 use crate::discovery::{RepoCandidate, discover_repos_excluding, fuzzy_matches};
 use crate::git;
+use crate::opener::{OpenPlan, Opener};
 use crate::session::{RepoKind, RepoLink, RepoSelection, SessionMetadata, SessionStore};
 
 pub fn run_interactive(paths: &DynwsPaths, cwd: &Path) -> Result<RepoFlowOutcome> {
@@ -45,13 +47,14 @@ pub fn run_interactive(paths: &DynwsPaths, cwd: &Path) -> Result<RepoFlowOutcome
         println!("no subdirectories found in {}", cwd.display());
         return Ok(RepoFlowOutcome::Cancelled);
     }
-    app.repos = repos;
+    app.set_repos(repos);
     app.message.clear();
     run_app(terminal.terminal_mut(), &mut app)
 }
 
 pub struct ManagerOutcome {
     pub open_session: Option<String>,
+    pub editor: Option<String>,
     pub changes: Vec<String>,
 }
 
@@ -66,6 +69,7 @@ pub fn run_session_manager(
     let open_session = run_session_manager_app(terminal.terminal_mut(), &mut app, cwd)?;
     Ok(ManagerOutcome {
         open_session,
+        editor: app.requested_editor.map(|(_, editor)| editor),
         changes: app.changes,
     })
 }
@@ -145,7 +149,23 @@ fn run_session_manager_app(
     cwd: &Path,
 ) -> Result<Option<String>> {
     loop {
+        app.poll_open();
+        if let Some((session, _)) = &app.requested_editor {
+            return Ok(Some(session.clone()));
+        }
         terminal.draw(|frame| app.draw(frame))?;
+        if app.opening.is_some() && !event::poll(Duration::from_millis(80))? {
+            continue;
+        }
+        // The launcher signature advances only while nothing is happening.
+        if app.view.animating
+            && app.view.overlay.is_none()
+            && app.view.palette.is_none()
+            && !event::poll(Duration::from_millis(80))?
+        {
+            app.tick = app.tick.wrapping_add(1);
+            continue;
+        }
         let Some(key) = app.input_key(event::read()?) else {
             continue;
         };
@@ -171,7 +191,7 @@ fn run_session_manager_app(
             SessionManagerSignal::Open { session_name } => return Ok(Some(session_name)),
             SessionManagerSignal::New => {
                 app.message = "Loading repositories…".into();
-                terminal.draw(|frame| app.draw(frame))?;
+                let backdrop = terminal.draw(|frame| app.draw(frame))?.buffer.clone();
                 let repos = match discover_repos_excluding(cwd, Some(&app.store.paths().home)) {
                     Ok(repos) => repos,
                     Err(error) => {
@@ -180,6 +200,7 @@ fn run_session_manager_app(
                     }
                 };
                 let mut picker = App::new(repos, app.store.clone());
+                picker.backdrop = Some(backdrop);
                 match run_app(terminal, &mut picker)? {
                     RepoFlowOutcome::Completed(session) => {
                         app.changes.push(format!(
@@ -213,7 +234,7 @@ fn run_add_repos_app(
     repo_cursor: usize,
 ) -> Result<RepoFlowOutcome> {
     manager.message = "Loading repositories…".into();
-    terminal.draw(|frame| manager.draw(frame))?;
+    let backdrop = terminal.draw(|frame| manager.draw(frame))?.buffer.clone();
     let Some(session) = manager
         .sessions
         .iter()
@@ -232,6 +253,7 @@ fn run_add_repos_app(
     };
     let mut picker = App::for_add(repos, manager.store.clone(), session_name.clone());
     picker.expected = Some(session);
+    picker.backdrop = Some(backdrop);
     match run_app(terminal, &mut picker)? {
         RepoFlowOutcome::Completed(updated) => {
             manager.finish_repo_add(&session_name, updated.clone(), &picker.added_repos);
@@ -540,6 +562,8 @@ fn folder_tree(path: &Path) -> Vec<String> {
 
 struct App {
     repos: Vec<RepoCandidate>,
+    /// The folder of each repository, parallel to `repos`; see `set_repos`.
+    repo_groups: Vec<String>,
     selected: BTreeSet<usize>,
     worktree_selected: BTreeSet<usize>,
     worktree_choices: Vec<WorktreeChoice>,
@@ -555,12 +579,16 @@ struct App {
     expected: Option<SessionMetadata>,
     folder_tree: FolderTree,
     view: View,
+    /// The screen the flow was opened from, shown dimmed behind the dialog.
+    backdrop: Option<ratatui::buffer::Buffer>,
 }
 
 impl App {
     fn new(repos: Vec<RepoCandidate>, store: SessionStore) -> Self {
+        let repo_groups = repo_groups(&repos, &store.paths().collection_root);
         Self {
             repos,
+            repo_groups,
             selected: BTreeSet::new(),
             worktree_selected: BTreeSet::new(),
             worktree_choices: Vec::new(),
@@ -576,7 +604,14 @@ impl App {
             expected: None,
             folder_tree: FolderTree::default(),
             view: View::default(),
+            backdrop: None,
         }
+    }
+
+    /// Replaces the repositories and refreshes their cached folders.
+    fn set_repos(&mut self, repos: Vec<RepoCandidate>) {
+        self.repo_groups = repo_groups(&repos, &self.store.paths().collection_root);
+        self.repos = repos;
     }
 
     fn for_add(repos: Vec<RepoCandidate>, store: SessionStore, session_name: String) -> Self {
@@ -588,170 +623,555 @@ impl App {
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         self.view.size = frame.area();
+        self.view.animating = false;
         let theme = Theme::new();
-        let (title, mode) = match &self.purpose {
-            AppPurpose::AddRepos { session_name } => {
-                (format!("Add to {session_name}"), "Add repositories")
+        let area = frame.area();
+        let hint = match &self.mode {
+            Mode::Select if self.filter.is_empty() => {
+                "Enter Next  Ctrl+S Link  Ctrl+W Worktree  Esc Cancel"
             }
-            AppPurpose::CreateSession => ("New session".to_string(), "New session"),
+            Mode::Select => "Enter Next  Ctrl+S Link  Ctrl+W Worktree  Esc Clear",
+            Mode::BranchLoading => "Esc Cancel fetch",
+            Mode::Branch(_) => "Enter Choose branch  Esc Back",
+            Mode::Name => "Enter Create session  Esc Back",
+            Mode::Duplicate { .. } => "r Reuse  n Create duplicate  Esc Rename",
         };
-        let select_hint = if self.filter.is_empty() {
-            "Enter Next  Ctrl+S Link  Ctrl+W Worktree  Esc Cancel"
-        } else {
-            "Enter Next  Ctrl+S Link  Ctrl+W Worktree  Esc Clear"
-        };
-        let (stage, mut input, hint) = match &self.mode {
-            Mode::Select => (
-                "Select repositories",
-                Input::new("Type to filter repositories", &self.filter),
-                select_hint,
-            ),
-            Mode::BranchLoading => (
-                "Fetching branches",
-                Input::new("Type to filter repositories", &self.filter),
-                "Esc Cancel fetch",
-            ),
-            Mode::Branch(picker) => (
-                "Choose branches",
-                Input::new("Type to filter branches", &picker.filter),
-                "Enter Choose branch  Esc Back",
-            ),
-            Mode::Name => (
-                "Name session",
-                Input::new("Name this session", &self.session_name),
-                "Enter Create session  Esc Back",
-            ),
-            Mode::Duplicate { existing } => (
-                "Matching session",
-                Input::readonly("Matching session", &existing.name),
-                "r Reuse  n Create duplicate  Esc Rename",
-            ),
-        };
-        let indices = self.visible_repos();
-        let hidden = self
-            .selected
-            .iter()
-            .chain(&self.worktree_selected)
-            .filter(|idx| !indices.contains(idx))
-            .count();
-        let fetching = self.branch_fetch.as_ref().map(|fetch| {
-            format!(
-                "Fetching origin for {}… ({}/{}) · esc cancels",
-                fetch.repo_name,
-                fetch.current + 1,
-                fetch.repo_indices.len()
-            )
-        });
-        let status = if let Some(fetching) = fetching {
-            fetching
-        } else if let Mode::Branch(picker) = &self.mode {
-            format!(
-                "{} / {} branches",
-                self.filtered_branch_indices(picker).len(),
-                picker.branches.len()
-            )
-        } else {
-            format!(
-                "{} / {} · {} selected · {hidden} hidden",
-                indices.len(),
-                self.repos.len(),
-                self.selected.len() + self.worktree_selected.len()
-            )
-        };
-        let message = &self.message;
-        let location = display_path(&self.store.paths().collection_root);
-        input.editable &= self.view.overlay.is_none() && self.view.palette.is_none();
-        let Some(surface) = shell(
-            frame,
-            Screen {
-                title: &title,
-                subtitle: stage,
-                mode,
-                bar: theme.accent,
-                input,
-                status: &status,
-                hints: hint,
-                message,
-                location: &location,
-                home: None,
-            },
-            &mut self.view,
-        ) else {
+        if !begin(frame, hint, &self.message, &mut self.view) {
             return;
-        };
-        self.view.page = surface.list.height;
-        if let Some(area) = surface.preview {
-            let hint = self.item_details().draw(frame, area);
-            self.view.hits.push(HitRegion {
-                area: hint,
-                target: HitTarget::Key(key_event(KeyCode::F(2), KeyModifiers::NONE)),
-            });
         }
-        let area = surface.list;
-        match &self.mode {
+        if let Some(backdrop) = &self.backdrop {
+            copy_backdrop(frame.buffer_mut(), backdrop);
+        }
+        let (title, description) = match &self.purpose {
+            AppPurpose::AddRepos { session_name } => (
+                format!("Add repositories to {session_name}"),
+                "Links more repositories into the existing workspace.",
+            ),
+            AppPurpose::CreateSession => (
+                "New session".to_string(),
+                "Links repositories into one workspace. Source repositories are never modified.",
+            ),
+        };
+        let scale = Scale::new(area);
+        let width = scale.creation_width();
+        let small = area.height < 16;
+        let description = if small { "" } else { description };
+        let margin = if area.height >= 24 { 2 } else { 0 };
+        let body = area.height.saturating_sub(margin + dialog_chrome(!small));
+        let drawn = dialog_sized(frame, width, body, &title, description, theme);
+        self.view.block_click_through();
+        self.view.hits.push(HitRegion {
+            area: drawn.close,
+            target: HitTarget::Key(key_event(KeyCode::Esc, KeyModifiers::NONE)),
+        });
+        let content = drawn.content;
+        if content.height < 4 {
+            self.view.draw_overlay(frame);
+            return;
+        }
+        let names: &[&str] = if self.is_adding() {
+            &["Repositories", "Branches"]
+        } else {
+            &["Repositories", "Branches", "Name"]
+        };
+        let step = match self.mode {
+            Mode::Select | Mode::BranchLoading => 0,
+            Mode::Branch(_) => 1,
+            Mode::Name | Mode::Duplicate { .. } => 2,
+        }
+        .min(names.len() - 1);
+        let status = self.creation_status();
+        let status_width = (Line::raw(&status).width() as u16).min(content.width);
+        frame.render_widget(
+            Paragraph::new(clip_line(
+                stepper(
+                    names,
+                    step,
+                    content.width.saturating_sub(status_width + 2) as usize,
+                    theme,
+                ),
+                content.width.saturating_sub(status_width + 2) as usize,
+            )),
+            Rect::new(content.x, content.y, content.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(status.as_str()).style(theme.muted),
+            Rect::new(content.right() - status_width, content.y, status_width, 1),
+        );
+        let footer = View::footer_rows(area);
+        let top = content.y + if small { 1 } else { 2 };
+        let bottom = content.bottom().saturating_sub(footer + u16::from(!small));
+        let height = bottom.saturating_sub(top);
+        let split = content.width >= 84;
+        let left_width = if split {
+            scale.creation_left(content.width)
+        } else {
+            content.width
+        };
+        let left = Rect::new(content.x, top, left_width, height);
+        if split {
+            let rule = content.x + left_width + 3;
+            for y in top..bottom {
+                frame.render_widget(
+                    Paragraph::new("│").style(theme.border),
+                    Rect::new(rule, y, 1, 1),
+                );
+            }
+            let right = Rect::new(
+                rule + 3,
+                top,
+                content.right().saturating_sub(rule + 3),
+                height,
+            );
+            frame.render_widget(
+                Paragraph::new(self.creation_preview(right.width, right.height, theme)),
+                right,
+            );
+        }
+        self.draw_creation_body(frame, left, theme);
+        let (buttons, keys, footer_hint) = self.creation_buttons();
+        self.view
+            .draw_footer(frame, drawn, footer, &buttons, &keys, footer_hint, theme);
+        self.view.draw_overlay(frame);
+    }
+
+    /// The left column of the creation dialog for the current step.
+    fn draw_creation_body(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme) {
+        if area.height == 0 {
+            return;
+        }
+        let screen = frame.area();
+        let rows = item_rows(screen);
+        let editable = self.view.overlay.is_none() && self.view.palette.is_none();
+        let field_rows = if area.height >= 12 {
+            4
+        } else if area.height >= 8 {
+            3
+        } else {
+            1
+        };
+        let gap = u16::from(field_rows > 1);
+        let below =
+            |top: u16| Rect::new(area.x, top, area.width, area.bottom().saturating_sub(top));
+        match self.mode.clone() {
+            Mode::Select | Mode::BranchLoading => {
+                let indices = self.visible_repos();
+                draw_field(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, field_rows),
+                    &Field {
+                        label: "Repositories",
+                        aside: "",
+                        value: &self.filter,
+                        placeholder: "Filter by name or path",
+                        editable,
+                    },
+                    theme,
+                );
+                let mut list = below(area.y + field_rows + gap);
+                if let Some(fetch) = &self.branch_fetch
+                    && list.height >= 6
+                {
+                    let action = alert(
+                        frame,
+                        Rect::new(list.x, list.y, list.width, 4),
+                        "◐",
+                        &format!(
+                            "Fetching origin for {}… ({}/{})",
+                            fetch.repo_name,
+                            fetch.current + 1,
+                            fetch.repo_indices.len()
+                        ),
+                        "Filtering still works while branches load.",
+                        Some(("esc", "cancel")),
+                        theme,
+                    );
+                    if let Some(rect) = action {
+                        self.view.hits.push(HitRegion {
+                            area: rect,
+                            target: HitTarget::Key(key_event(KeyCode::Esc, KeyModifiers::NONE)),
+                        });
+                    }
+                    list = below(list.y + 5);
+                }
+                let groups = indices
+                    .iter()
+                    .map(|idx| self.repo_groups[*idx].as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut entries = Vec::new();
+                let mut current = None;
+                for idx in &indices {
+                    let group = self.repo_groups[*idx].as_str();
+                    if groups.len() > 1 && current != Some(group) {
+                        entries.push(Entry::Heading(if group.is_empty() {
+                            "top level".into()
+                        } else {
+                            group.to_owned()
+                        }));
+                        current = Some(group);
+                    }
+                    let (marker, kind) = if self.selected.contains(idx) {
+                        ((SELECTED, theme.key), "link")
+                    } else if self.worktree_selected.contains(idx) {
+                        ((WORKTREE, theme.key), "worktree")
+                    } else {
+                        ((UNSELECTED, theme.muted), "")
+                    };
+                    entries.push(Entry::Item(Item {
+                        names: Vec::new(),
+                        italic: false,
+                        marker: Some(marker),
+                        name: self.repos[*idx].name.clone(),
+                        meta: kind.into(),
+                        sub: self.repo_summary(*idx),
+                        detail: display_path(&self.repos[*idx].path),
+                    }));
+                }
+                let pointer = if matches!(self.mode, Mode::Select) {
+                    Pointer::Select
+                } else {
+                    Pointer::Focus
+                };
+                self.view.page = (list.height / rows).max(1);
+                draw_entries(
+                    frame,
+                    list,
+                    &entries,
+                    self.cursor,
+                    false,
+                    rows,
+                    "No repositories match — esc clears the filter or returns",
+                    pointer,
+                    false,
+                    &mut self.view,
+                );
+            }
             Mode::Branch(picker) => {
-                let rows = self
-                    .filtered_branch_indices(picker)
+                let repo = picker
+                    .repo_indices
+                    .get(picker.current)
+                    .and_then(|idx| self.repos.get(*idx))
+                    .map(|repo| repo.name.clone())
+                    .unwrap_or_default();
+                let filtered = self.filtered_branch_indices(&picker);
+
+                draw_field(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, field_rows),
+                    &Field {
+                        label: &format!("Branch for {repo}"),
+                        aside: "",
+                        value: &picker.filter,
+                        placeholder: "Filter branches",
+                        editable,
+                    },
+                    theme,
+                );
+                let entries = filtered
                     .iter()
                     .map(|idx| {
                         let branch = &picker.branches[*idx];
-                        row(None, &branch.name, &branch.remote_ref, area.width)
+                        Entry::Item(Item {
+                            names: Vec::new(),
+                            italic: false,
+                            marker: None,
+                            name: branch.name.clone(),
+                            meta: String::new(),
+                            sub: branch.remote_ref.clone(),
+                            detail: String::new(),
+                        })
                     })
-                    .collect();
-                draw_list(
+                    .collect::<Vec<_>>();
+                let list = below(area.y + field_rows + gap);
+                self.view.page = (list.height / rows).max(1);
+                draw_entries(
                     frame,
-                    area,
-                    rows,
+                    list,
+                    &entries,
                     self.cursor,
-                    &mut self.view.branches,
-                    "No matching branches — esc returns",
-                );
-                self.view.list_hits(
-                    area,
-                    self.filtered_branch_indices(picker).len(),
                     true,
+                    rows,
+                    "No matching branches — esc returns",
+                    Pointer::Focus,
                     false,
+                    &mut self.view,
                 );
             }
-            _ => {
-                let rows = indices
-                    .iter()
-                    .map(|idx| {
-                        let repo = &self.repos[*idx];
-                        let marker = if self.selected.contains(idx) {
-                            (SELECTED, theme.success)
-                        } else if self.worktree_selected.contains(idx) {
-                            (WORKTREE, theme.accent)
-                        } else {
-                            (UNSELECTED, theme.muted)
-                        };
-                        row(
-                            Some(marker),
-                            &repo.name,
-                            &self.repo_summary(*idx),
-                            area.width,
-                        )
-                    })
-                    .collect();
-                draw_list(
+            Mode::Name => {
+                let folder = crate::session::normalize_name(&self.session_name)
+                    .map(|name| format!("folder {name}"))
+                    .unwrap_or_default();
+                draw_field(
                     frame,
-                    area,
-                    rows,
-                    self.cursor,
-                    &mut self.view.list,
-                    "No repositories match — esc clears the filter or returns",
+                    Rect::new(area.x, area.y, area.width, field_rows),
+                    &Field {
+                        label: "Session name",
+                        aside: &folder,
+                        value: &self.session_name,
+                        placeholder: "Letters, numbers and dashes",
+                        editable,
+                    },
+                    theme,
                 );
-                if matches!(self.mode, Mode::Select | Mode::BranchLoading) {
-                    self.view.list_hits(
-                        area,
-                        indices.len(),
-                        false,
-                        matches!(self.mode, Mode::Select),
-                    );
-                }
+                let mut entries = vec![Entry::Heading("Selected".into())];
+                entries.extend(self.visible_repos().iter().map(|idx| {
+                    let worktree = self.worktree_selected.contains(idx);
+                    Entry::Item(Item {
+                        names: Vec::new(),
+                        italic: false,
+                        marker: Some((if worktree { WORKTREE } else { SELECTED }, theme.key)),
+                        name: self.repos[*idx].name.clone(),
+                        meta: if worktree { "worktree" } else { "link" }.into(),
+                        sub: self.repo_summary(*idx),
+                        detail: display_path(&self.repos[*idx].path),
+                    })
+                }));
+                draw_entries(
+                    frame,
+                    below(area.y + field_rows + gap),
+                    &entries,
+                    usize::MAX,
+                    true,
+                    rows,
+                    "",
+                    Pointer::Inert,
+                    false,
+                    &mut self.view,
+                );
+            }
+            Mode::Duplicate { existing } => {
+                let lines = vec![
+                    Line::styled(
+                        format!("{} already links these repositories.", existing.name),
+                        theme.title,
+                    ),
+                    Line::styled(
+                        "Reuse it, or create a second session with the same repositories.",
+                        theme.muted,
+                    ),
+                ];
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
             }
         }
-        self.view.draw_overlay(frame);
+    }
+
+    /// Counts for the stepper row: selections, matches and hidden selections.
+    fn creation_status(&self) -> String {
+        match &self.mode {
+            Mode::Branch(picker) => format!(
+                "{} of {} branches",
+                self.filtered_branch_indices(picker).len(),
+                picker.branches.len()
+            ),
+            Mode::Select | Mode::BranchLoading => {
+                let indices = self.visible_repos();
+                let hidden = self
+                    .selected
+                    .iter()
+                    .chain(&self.worktree_selected)
+                    .filter(|idx| !indices.contains(idx))
+                    .count();
+                let mut status = format!(
+                    "{} selected · {} of {}",
+                    self.selected.len() + self.worktree_selected.len(),
+                    indices.len(),
+                    self.repos.len()
+                );
+                if hidden > 0 {
+                    status.push_str(&format!(" · {hidden} hidden"));
+                }
+                status
+            }
+            Mode::Name | Mode::Duplicate { .. } => count_label(
+                self.selected.len() + self.worktree_selected.len(),
+                "repository",
+                "repositories",
+            ),
+        }
+    }
+
+    /// The right column: exactly what the session will contain on disk,
+    /// then the focused repository's folders when there is room.
+    fn creation_preview(&self, width: u16, height: u16, theme: Theme) -> Vec<Line<'static>> {
+        let paths = self.store.paths();
+        let width = width as usize;
+        let adding = self.is_adding();
+        let mut lines = vec![
+            Line::from(heading(
+                if adding { "Will add" } else { "Will create" },
+                theme,
+            )),
+            Line::raw(""),
+        ];
+        let workspace = match &self.purpose {
+            AppPurpose::AddRepos { session_name } => {
+                Some(display_path(&self.store.workspace_path(session_name)))
+            }
+            AppPurpose::CreateSession => crate::session::normalize_name(&self.session_name)
+                .ok()
+                .map(|name| display_path(&self.store.workspace_path(&name))),
+        };
+        lines.push(match workspace {
+            Some(path) => Line::styled(clip(&format!("{path}/"), width), theme.key),
+            None => Line::styled(
+                clip(
+                    &format!("{}/<name>/", display_path(&paths.workspaces_dir)),
+                    width,
+                ),
+                theme.muted,
+            ),
+        });
+        lines.push(Line::raw(""));
+        let chosen = (0..self.repos.len())
+            .filter(|idx| self.selected.contains(idx) || self.worktree_selected.contains(idx))
+            .collect::<Vec<_>>();
+        if chosen.is_empty() {
+            lines.push(Line::styled(
+                clip("Select repositories to see what will be created.", width),
+                theme.muted,
+            ));
+        }
+        for idx in chosen {
+            let repo = &self.repos[idx];
+            let worktree = self.worktree_selected.contains(&idx);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(repo.name.clone(), theme.title),
+                Span::styled(if worktree { "  worktree" } else { "  link" }, theme.muted),
+            ]));
+            let target = if worktree {
+                let directory = repo
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| repo.name.clone());
+                match self
+                    .worktree_choices
+                    .iter()
+                    .find(|choice| choice.repo_idx == idx)
+                {
+                    Some(choice) => {
+                        let slug = git::branch_worktree_slug(&choice.branch.name)
+                            .unwrap_or_else(|_| choice.branch.name.clone());
+                        (
+                            display_path(&paths.worktrees_dir.join(directory).join(slug)),
+                            theme.key,
+                        )
+                    }
+                    None => (
+                        format!(
+                            "{}/<branch>",
+                            display_path(&paths.worktrees_dir.join(directory))
+                        ),
+                        theme.muted,
+                    ),
+                }
+            } else {
+                (display_path(&repo.path), theme.key)
+            };
+            lines.push(Line::styled(
+                clip(&format!("    → {}", target.0), width),
+                target.1,
+            ));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(heading("Unchanged", theme)));
+        lines.push(Line::styled(
+            clip(
+                &format!(
+                    "  source repositories in {}",
+                    display_path(&paths.collection_root)
+                ),
+                width,
+            ),
+            theme.muted,
+        ));
+        let room = (height as usize).saturating_sub(lines.len() + 2);
+        if room >= 3
+            && let Some(repo) = self.active_repo_index().and_then(|idx| self.repos.get(idx))
+        {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(heading(&format!("Inside {}", repo.name), theme)));
+            let tree = self
+                .folder_tree
+                .cache
+                .get(&repo.path)
+                .cloned()
+                .unwrap_or_else(|| vec!["Loading folder tree…".into()]);
+            for line in tree.iter().take(room - 1) {
+                lines.push(Line::styled(clip(&format!("  {line}"), width), theme.muted));
+            }
+        }
+        lines
+    }
+
+    /// Footer buttons for the current step, with the keys they send.
+    fn creation_buttons(&self) -> (Vec<Button<'static>>, Vec<KeyEvent>, &'static str) {
+        let esc = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let button = |icon, label, key, strong| Button {
+            icon,
+            label,
+            key,
+            strong,
+        };
+        match &self.mode {
+            Mode::Select => (
+                vec![
+                    button(
+                        "",
+                        if self.filter.is_empty() {
+                            "Cancel"
+                        } else {
+                            "Clear"
+                        },
+                        "esc",
+                        false,
+                    ),
+                    if self.is_adding() && self.worktree_selected.is_empty() {
+                        button("✓", "Add repositories", "enter", true)
+                    } else {
+                        button("›", "Next", "enter", true)
+                    },
+                ],
+                vec![esc, enter],
+                "ctrl+s link · ctrl+w worktree",
+            ),
+            Mode::BranchLoading => (
+                vec![button("", "Cancel fetch", "esc", false)],
+                vec![esc],
+                "",
+            ),
+            Mode::Branch(_) => (
+                vec![
+                    button("‹", "Back", "esc", false),
+                    button("›", "Choose branch", "enter", true),
+                ],
+                vec![esc, enter],
+                "double-click chooses a branch",
+            ),
+            Mode::Name => (
+                vec![
+                    button("‹", "Back", "esc", false),
+                    button("✓", "Create session", "enter", true),
+                ],
+                vec![esc, enter],
+                "",
+            ),
+            Mode::Duplicate { .. } => (
+                vec![
+                    button("", "Rename", "esc", false),
+                    button("", "Create anyway", "n", false),
+                    button("›", "Reuse it", "r", true),
+                ],
+                vec![
+                    esc,
+                    key_event(KeyCode::Char('n'), KeyModifiers::NONE),
+                    key_event(KeyCode::Char('r'), KeyModifiers::NONE),
+                ],
+                "",
+            ),
+        }
     }
 
     fn is_adding(&self) -> bool {
@@ -1419,12 +1839,16 @@ impl App {
             .copied()
     }
 
+    /// Matching repositories, grouped by the folder they sit in.
     fn filtered_indices(&self) -> Vec<usize> {
-        self.repos
+        let mut indices = self
+            .repos
             .iter()
             .enumerate()
             .filter_map(|(idx, repo)| fuzzy_matches(&self.filter, repo).then_some(idx))
-            .collect()
+            .collect::<Vec<_>>();
+        indices.sort_by(|a, b| self.repo_groups[*a].cmp(&self.repo_groups[*b]));
+        indices
     }
 
     fn filtered_branch_indices(&self, picker: &BranchPicker) -> Vec<usize> {
@@ -1477,7 +1901,38 @@ enum SessionManagerMode {
     },
 }
 
+struct OpenDialog {
+    session: String,
+    choice: usize,
+    remember: bool,
+    config: Config,
+    confirmation: Option<OpenPlan>,
+}
+
+fn save_open_preferences(paths: &DynwsPaths, dialog: &OpenDialog, confirmed: bool) -> Result<()> {
+    if dialog.remember || confirmed {
+        let _lock = paths.mutation_lock()?;
+        let mut current = Config::load(paths)?;
+        anyhow::ensure!(
+            current == dialog.config,
+            "Configuration changed elsewhere; reopen Open with and retry"
+        );
+        if dialog.remember {
+            current.open.opener = Some(Opener::ALL[dialog.choice]);
+        }
+        if confirmed {
+            current.open.t3_confirmed = true;
+        }
+        current.save(paths)?;
+    }
+    Ok(())
+}
+
 struct SessionManagerApp {
+    requested_editor: Option<(String, String)>,
+    open_dialog: Option<OpenDialog>,
+    opening: Option<Receiver<Result<String>>>,
+    open_details: String,
     sessions: Vec<SessionMetadata>,
     store: SessionStore,
     selected: BTreeSet<String>,
@@ -1488,12 +1943,315 @@ struct SessionManagerApp {
     changes: Vec<String>,
     present_paths: BTreeSet<String>,
     view: View,
+    /// Browse shows the launcher home (true) or the full session list.
+    launcher: bool,
+    /// Animation frame for the launcher signature.
+    tick: u64,
 }
 
 impl SessionManagerApp {
+    fn start_open_dialog(&mut self, t3: bool) {
+        let Some(session) = self.active_session().or_else(|| self.current_session()) else {
+            return;
+        };
+        let name = session.name.clone();
+        match Config::load(self.store.paths()) {
+            Ok(config) => {
+                let choice = if t3 {
+                    1
+                } else {
+                    Opener::ALL
+                        .iter()
+                        .position(|opener| Some(*opener) == config.open.opener)
+                        .unwrap_or(0)
+                };
+                self.open_dialog = Some(OpenDialog {
+                    session: name,
+                    choice,
+                    remember: false,
+                    config,
+                    confirmation: None,
+                });
+                self.view.scroll = 0;
+                if t3 {
+                    self.handle_open_key(key_event(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+            Err(error) => self.message = format!("Error: {error:#}"),
+        }
+    }
+
+    fn handle_open_key(&mut self, key: KeyEvent) {
+        let Some(mut dialog) = self.open_dialog.take() else {
+            return;
+        };
+        if key.code == KeyCode::Esc {
+            if dialog.confirmation.take().is_some() {
+                self.open_dialog = Some(dialog);
+            }
+            return;
+        }
+        if dialog.confirmation.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('n') => {
+                    dialog.confirmation = None;
+                }
+                KeyCode::Char('y') => {
+                    let plan = dialog.confirmation.take().expect("confirmation exists");
+                    self.execute_open(dialog, plan, true);
+                    return;
+                }
+                KeyCode::Up | KeyCode::PageUp => {
+                    self.view.scroll = self.view.scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::PageDown => {
+                    self.view.scroll = self.view.scroll.saturating_add(1)
+                }
+                _ => {}
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('1'..='3') => {
+                    dialog.choice = (key.code.as_char().unwrap() as u8 - b'1') as usize
+                }
+                KeyCode::Up => dialog.choice = dialog.choice.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => dialog.choice = (dialog.choice + 1) % 3,
+                KeyCode::Char(' ') => dialog.remember = !dialog.remember,
+                KeyCode::Enter => {
+                    let opener = Opener::ALL[dialog.choice];
+                    let workspace = self.store.workspace_path(&dialog.session);
+                    match OpenPlan::new(opener, &dialog.config, &workspace, None) {
+                        Ok(plan) if opener == Opener::T3 && !dialog.config.open.t3_confirmed => {
+                            dialog.confirmation = Some(plan);
+                            self.view.scroll = 0;
+                        }
+                        Ok(plan) => {
+                            self.execute_open(dialog, plan, false);
+                            return;
+                        }
+                        Err(error) => {
+                            self.open_details = format!("{error:#}");
+                            self.message = "Could not open session · F2 details".into();
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.open_dialog = Some(dialog);
+    }
+
+    fn execute_open(&mut self, dialog: OpenDialog, plan: OpenPlan, confirmed: bool) {
+        if dialog.choice == 0 && !dialog.config.open.background {
+            match save_open_preferences(self.store.paths(), &dialog, confirmed) {
+                Ok(()) => {
+                    self.requested_editor = Some((
+                        dialog.session,
+                        dialog
+                            .config
+                            .editor
+                            .default
+                            .unwrap_or_else(|| "cursor --new-window".into()),
+                    ));
+                }
+                Err(error) => {
+                    self.message = "Could not open session · F2 details".into();
+                    self.open_details = format!("{error:#}");
+                }
+            }
+            return;
+        }
+        self.open_details = plan.description();
+        self.message = format!(
+            "Opening {} with {}…",
+            dialog.session,
+            Opener::ALL[dialog.choice].label(&dialog.config)
+        );
+        let (sender, receiver) = mpsc::channel();
+        self.opening = Some(receiver);
+        let paths = self.store.paths().clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                save_open_preferences(&paths, &dialog, confirmed)?;
+                let output = plan.run()?;
+                if dialog.config.open.cd {
+                    crate::request_cd(&SessionStore::new(paths).workspace_path(&dialog.session));
+                }
+                Ok(format!("Opened {}\n{output}", dialog.session))
+            })();
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_open(&mut self) {
+        let Some(receiver) = &self.opening else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.opening = None;
+                match result {
+                    Ok(output) => {
+                        self.message = output.lines().next().unwrap_or("Opened session").into();
+                        self.open_details = output;
+                    }
+                    Err(error) => {
+                        self.message = "Could not open session · F2 details".into();
+                        self.open_details = format!("{error:#}");
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.opening = None;
+                self.message = "Opener stopped unexpectedly · retry Ctrl+O".into();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn draw_open_dialog(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let Some(open) = &self.open_dialog else {
+            return;
+        };
+        let cancel = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        if let Some(plan) = &open.confirmation {
+            self.view.text_dialog(
+                frame,
+                &format!("Open {} in T3 Code", open.session),
+                "Adds a T3 project and opens the desktop app.",
+                &plan.description(),
+                TextStyle::Fields,
+                &[
+                    Button {
+                        icon: "",
+                        label: "Cancel",
+                        key: "enter",
+                        strong: true,
+                    },
+                    Button {
+                        icon: "›",
+                        label: "Open",
+                        key: "y",
+                        strong: false,
+                    },
+                ],
+                &[enter, key_event(KeyCode::Char('y'), KeyModifiers::NONE)],
+                "enter cancels",
+            );
+            return;
+        }
+        let theme = Theme::new();
+        let footer = View::footer_rows(frame.area());
+        let drawn = dialog(
+            frame,
+            66,
+            8 + footer,
+            &format!("Open {}", open.session),
+            "Choose where to open this workspace",
+            theme,
+        );
+        self.view.block_click_through();
+        self.view.hits.push(HitRegion {
+            area: drawn.close,
+            target: HitTarget::Key(cancel),
+        });
+        let content = drawn.content;
+        let room = content.height.saturating_sub(footer);
+        let step = if room >= 7 { 2 } else { 1 };
+        for (idx, opener) in Opener::ALL.into_iter().enumerate() {
+            let row = idx as u16 * step;
+            if row >= room {
+                break;
+            }
+            let selected = idx == open.choice;
+            let line = format!(
+                "{} {}  {}",
+                if selected { "›" } else { " " },
+                idx + 1,
+                opener.label(&open.config)
+            );
+            let area = Rect::new(content.x, content.y + row, content.width, 1);
+            frame.render_widget(
+                Paragraph::new(clip(&line, content.width as usize)).style(if selected {
+                    theme.focus
+                } else {
+                    theme.muted
+                }),
+                area,
+            );
+            self.view.hits.push(HitRegion {
+                area,
+                target: HitTarget::Key(key_event(
+                    KeyCode::Char((b'1' + idx as u8) as char),
+                    KeyModifiers::NONE,
+                )),
+            });
+            if step == 2 && row + 1 < room {
+                let description = match opener {
+                    Opener::Editor => "Your configured editor",
+                    Opener::T3 => "Adds a project if needed, then opens T3",
+                    Opener::Finder => "Show the workspace folder",
+                };
+                frame.render_widget(
+                    Paragraph::new(clip(description, content.width as usize)).style(theme.muted),
+                    Rect::new(content.x, content.y + row + 1, content.width, 1),
+                );
+            }
+        }
+        let row = 3 * step;
+        if row < room {
+            let area = Rect::new(content.x, content.y + row, content.width, 1);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "[{}] {}",
+                    if open.remember { "x" } else { " " },
+                    if content.width >= 37 {
+                        "Use this choice for every session"
+                    } else {
+                        "Use for every session"
+                    }
+                ))
+                .style(theme.muted),
+                area,
+            );
+            self.view.hits.push(HitRegion {
+                area,
+                target: HitTarget::Key(key_event(KeyCode::Char(' '), KeyModifiers::NONE)),
+            });
+        }
+        self.view.draw_footer(
+            frame,
+            drawn,
+            footer,
+            &[
+                Button {
+                    icon: "",
+                    label: "Cancel",
+                    key: "esc",
+                    strong: false,
+                },
+                Button {
+                    icon: "›",
+                    label: "Open",
+                    key: "enter",
+                    strong: true,
+                },
+            ],
+            &[cancel, enter],
+            "1–3 choose · space remember",
+            theme,
+        );
+    }
+
     fn new(sessions: Vec<SessionMetadata>, store: SessionStore) -> Self {
         let present_paths = present_paths(&sessions);
         Self {
+            requested_editor: None,
+            open_dialog: None,
+            opening: None,
+            open_details: String::new(),
             sessions,
             store,
             selected: BTreeSet::new(),
@@ -1504,51 +2262,52 @@ impl SessionManagerApp {
             changes: Vec::new(),
             present_paths,
             view: View::default(),
+            launcher: true,
+            tick: 0,
         }
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         self.view.size = frame.area();
+        self.view.animating = false;
         let theme = Theme::new();
+        let area = frame.area();
         let visible = self.filtered_indices();
+        let shown = visible
+            .iter()
+            .map(|idx| self.sessions[*idx].name.as_str())
+            .collect::<BTreeSet<_>>();
         let hidden = self
             .selected
             .iter()
-            .filter(|name| {
-                !visible
-                    .iter()
-                    .any(|idx| self.sessions[*idx].name.as_str() == name.as_str())
-            })
+            .filter(|name| !shown.contains(name.as_str()))
             .count();
+        let launcher = self.launcher_visible();
         let expanded = self.expanded_session_name();
-        let title = expanded.clone().unwrap_or_else(|| "Sessions".into());
-        let input = match &self.mode {
-            SessionManagerMode::Expanded { .. } | SessionManagerMode::ConfirmRemoveRepo { .. } => {
-                Input::readonly("esc returns to sessions", "")
-            }
-            mode => Input {
-                placeholder: "Type to filter sessions",
-                value: &self.filter,
-                editable: matches!(mode, SessionManagerMode::Browse)
-                    && self.view.overlay.is_none()
-                    && self.view.palette.is_none(),
-            },
-        };
-        let home = (self.sessions.is_empty() && matches!(self.mode, SessionManagerMode::Browse))
-            .then_some("Ctrl+N to create your first session");
         let hint = match &self.mode {
-            SessionManagerMode::Browse if home.is_some() => "Ctrl+N New  Ctrl+R Refresh",
-            SessionManagerMode::Browse if self.filter.is_empty() => BROWSE_HINTS,
-            SessionManagerMode::Browse => FILTERED_BROWSE_HINTS,
-            SessionManagerMode::Expanded { .. } => {
-                "Enter Open  Ctrl+A Add  Ctrl+D Remove link  Esc Back"
+            SessionManagerMode::Browse if self.sessions.is_empty() => {
+                "Ctrl+N New  F1 Help  Ctrl+R Refresh".to_string()
             }
-            SessionManagerMode::Rename { .. } => "Enter Save  Esc Cancel",
-            _ => "Enter Cancel  y Confirm",
+            SessionManagerMode::Browse => format!(
+                "Enter Open  Ctrl+O Open with  Ctrl+T T3 Code  {}Ctrl+N New  Ctrl+A Add  Ctrl+E Rename  Ctrl+D Delete  Right Repos  Ctrl+S Select  Ctrl+R Refresh  Tab {}",
+                if self.filter.is_empty() {
+                    ""
+                } else {
+                    "Esc Clear  "
+                },
+                if self.launcher {
+                    "All sessions"
+                } else {
+                    "Launcher"
+                }
+            ),
+            SessionManagerMode::Expanded { .. } => {
+                "Enter Open  Ctrl+O Open with  Ctrl+T T3 Code  Ctrl+A Add  Ctrl+D Remove link  Esc Back".to_string()
+            }
+            SessionManagerMode::Rename { .. } => "Enter Save  Esc Cancel".to_string(),
+            _ => "Enter Cancel  y Confirm".to_string(),
         };
-        let status = if home.is_some() {
-            "none yet".to_string()
-        } else if let Some(session) = self.active_session() {
+        let status = if let Some(session) = self.active_session() {
             format!(
                 "{} · {}",
                 count_label(session.repos.len(), "repository", "repositories"),
@@ -1571,49 +2330,143 @@ impl SessionManagerApp {
             )
         };
         let location = display_path(&self.store.paths().collection_root);
-        let Some(surface) = shell(
-            frame,
-            Screen {
-                title: &title,
-                subtitle: if expanded.is_some() {
-                    "Repositories"
-                } else {
-                    ""
-                },
-                mode: if expanded.is_some() {
-                    "Repositories"
-                } else {
-                    "Sessions"
-                },
-                bar: theme.secondary,
-                input,
-                status: &status,
-                hints: hint,
-                message: &self.message,
-                location: &location,
-                home,
-            },
-            &mut self.view,
-        ) else {
+        let tick = self.motion().then_some(self.tick);
+        if !begin(frame, &hint, &self.message, &mut self.view) {
             return;
-        };
-        self.view.page = surface.list.height;
+        }
+        if self.sessions.is_empty() && matches!(self.mode, SessionManagerMode::Browse) {
+            draw_first_run(frame, &location, tick, theme, &mut self.view);
+            self.view.draw_overlay(frame);
+            return;
+        }
+        let rows = item_rows(area);
+        let editable = matches!(self.mode, SessionManagerMode::Browse)
+            && self.view.overlay.is_none()
+            && self.view.palette.is_none();
         let confirming = matches!(
             self.mode,
             SessionManagerMode::ConfirmRemoveSessions { .. }
                 | SessionManagerMode::ConfirmRemoveRepo { .. }
         );
-        if home.is_none() {
-            // A confirmation names its own targets; a focused-session preview
-            // beside it could be mistaken for one of them.
-            if let Some(area) = surface.preview.filter(|_| !confirming) {
-                let hint = self.item_details().draw(frame, area);
+        if launcher {
+            let groups = visible
+                .iter()
+                .take(chrome::MAX_GROUPS)
+                .map(|idx| chrome::Group {
+                    name: self.sessions[*idx].name.clone(),
+                    repos: self.sessions[*idx]
+                        .repos
+                        .iter()
+                        .map(|repo| repo.name.clone())
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            let acts = [
+                Act::new("+", "New session", "Ctrl+N"),
+                Act::new("≡", "All sessions", "Tab"),
+                COMMANDS,
+            ];
+            let list = launcher_layout(
+                frame,
+                &Launcher {
+                    groups: &groups,
+                    tick,
+                    field: Field {
+                        label: "Open a session",
+                        aside: &status,
+                        value: &self.filter,
+                        placeholder: "Search by name, repository or branch",
+                        editable,
+                    },
+                    acts: &acts,
+                    heading: visible
+                        .first()
+                        .map(|idx| {
+                            recency_group(&self.sessions[*idx].updated_at, chrono::Utc::now())
+                        })
+                        .unwrap_or("Recent"),
+                    aside: if self.filter.is_empty() {
+                        "last updated first"
+                    } else {
+                        "matches"
+                    },
+                },
+                theme,
+                &mut self.view,
+            );
+            self.view.page = (list.height / rows).max(1);
+            self.draw_rows(frame, list, &visible, rows, theme);
+            let fit = (list.height / rows) as usize;
+            if visible.len() > fit {
+                frame.render_widget(
+                    Paragraph::new(format!("+{} more · type to filter", visible.len() - fit))
+                        .style(theme.muted),
+                    Rect::new(list.x + 2, list.bottom(), list.width.saturating_sub(2), 1),
+                );
+            }
+        } else {
+            let crumbs: Vec<&str> = match &expanded {
+                Some(name) => vec!["dws", name.as_str(), "Repositories"],
+                None => vec!["dws", "Sessions"],
+            };
+            let acts: Vec<Act<'_>> = if expanded.is_some() {
+                vec![
+                    Act::new("‹", "Back", "Esc"),
+                    Act::new("+", "Add", "Ctrl+A"),
+                    Act::new("✕", "Remove", "Ctrl+D"),
+                    COMMANDS,
+                ]
+            } else {
+                vec![
+                    Act::strong("", "Open", "Enter"),
+                    Act::new("+", "New", "Ctrl+N"),
+                    COMMANDS,
+                ]
+            };
+            let field = if expanded.is_some() {
+                Field {
+                    label: "Repositories",
+                    aside: &location,
+                    value: "",
+                    placeholder: "esc returns to sessions",
+                    editable: false,
+                }
+            } else {
+                Field {
+                    label: "Filter sessions",
+                    aside: &location,
+                    value: &self.filter,
+                    placeholder: "Name, repository or branch",
+                    editable,
+                }
+            };
+            let surface = list_layout(
+                frame,
+                &Chrome {
+                    crumbs: &crumbs,
+                    status: &status,
+                    field,
+                    acts: &acts,
+                },
+                theme,
+                &mut self.view,
+            );
+            self.view.page = (surface.list.height / rows).max(1);
+            if let Some(sidebar) = surface.preview {
+                // A confirmation names its own targets; a focused-session
+                // preview beside it could be mistaken for one of them.
+                let details = if confirming {
+                    Details::default()
+                } else {
+                    self.item_details_in(&visible)
+                };
+                let hint = details.draw(frame, sidebar);
                 self.view.hits.push(HitRegion {
                     area: hint,
                     target: HitTarget::Key(key_event(KeyCode::F(2), KeyModifiers::NONE)),
                 });
             }
-            self.draw_rows(frame, surface.list, &visible, theme);
+            self.draw_rows(frame, surface.list, &visible, rows, theme);
         }
         self.view.draw_toast(frame);
         let cancel = key_event(KeyCode::Esc, KeyModifiers::NONE);
@@ -1621,30 +2474,32 @@ impl SessionManagerApp {
         match &self.mode {
             SessionManagerMode::ConfirmRemoveSessions { session_names } => {
                 let text = self.removal_text(session_names);
-                let title = if session_names.len() == 1 {
-                    "Delete session"
-                } else {
-                    "Delete sessions"
+                let title = match session_names.as_slice() {
+                    [name] => format!("Delete {name}?"),
+                    names => format!("Delete {} sessions?", names.len()),
                 };
                 self.view.text_dialog(
                     frame,
-                    title,
+                    &title,
+                    "This cannot be undone.",
                     &text,
                     TextStyle::Fields,
                     &[
                         Button {
+                            icon: "",
                             label: "Cancel",
-                            focused: true,
-                            danger: false,
+                            key: "enter",
+                            strong: true,
                         },
                         Button {
+                            icon: "✕",
                             label: "Delete",
-                            focused: false,
-                            danger: true,
+                            key: "y",
+                            strong: false,
                         },
                     ],
                     &[cancel, confirm],
-                    "y deletes · enter cancels",
+                    "enter cancels",
                 );
             }
             SessionManagerMode::ConfirmRemoveRepo {
@@ -1655,35 +2510,83 @@ impl SessionManagerApp {
                 let text = self.repo_removal_text(session_name, repo_name);
                 self.view.text_dialog(
                     frame,
-                    "Remove repository",
+                    &format!("Remove {repo_name} from {session_name}?"),
+                    "The session keeps its other repositories.",
                     &text,
                     TextStyle::Fields,
                     &[
                         Button {
+                            icon: "",
                             label: "Cancel",
-                            focused: true,
-                            danger: false,
+                            key: "enter",
+                            strong: true,
                         },
                         Button {
+                            icon: "✕",
                             label: "Remove",
-                            focused: false,
-                            danger: true,
+                            key: "y",
+                            strong: false,
                         },
                     ],
                     &[cancel, confirm],
-                    "y removes · enter cancels",
+                    "enter cancels",
                 );
             }
-            SessionManagerMode::Rename { input, .. } => {
-                let input = input.clone();
+            SessionManagerMode::Rename {
+                session_name,
+                input,
+            } => {
+                let (session_name, input) = (session_name.clone(), input.clone());
                 if self.view.overlay.is_none() && self.view.palette.is_none() {
-                    self.view
-                        .prompt_dialog(frame, "Rename session", &input, "New session name");
+                    let target = crate::session::normalize_name(&input)
+                        .map(|name| {
+                            format!(
+                                "Workspace moves to {}",
+                                display_path(&self.store.workspace_path(&name))
+                            )
+                        })
+                        .unwrap_or_else(|_| "Letters, numbers and dashes.".into());
+                    self.view.prompt_dialog(
+                        frame,
+                        &format!("Rename {session_name}"),
+                        &target,
+                        &Field {
+                            label: "Session name",
+                            aside: "",
+                            value: &input,
+                            placeholder: "New session name",
+                            editable: true,
+                        },
+                    );
                 }
             }
             _ => {}
         }
+        self.draw_open_dialog(frame);
         self.view.draw_overlay(frame);
+    }
+
+    /// Whether the launcher home replaces the list layout right now.
+    fn launcher_visible(&self) -> bool {
+        self.launcher
+            && self.view.size.width >= 60
+            && self.view.size.height >= 20
+            && !self.sessions.is_empty()
+            && matches!(
+                self.mode,
+                SessionManagerMode::Browse
+                    | SessionManagerMode::Rename { .. }
+                    | SessionManagerMode::ConfirmRemoveSessions { .. }
+            )
+    }
+
+    /// Animation runs only with color and without a reduced-motion request.
+    fn motion(&self) -> bool {
+        static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reduced = *REDUCED.get_or_init(|| {
+            std::env::var_os("DWS_REDUCE_MOTION").is_some_and(|value| !value.is_empty())
+        });
+        Theme::new().colors && !reduced
     }
 
     fn draw_rows(
@@ -1691,97 +2594,147 @@ impl SessionManagerApp {
         frame: &mut ratatui::Frame<'_>,
         area: Rect,
         visible: &[usize],
+        rows: u16,
         theme: Theme,
     ) {
         if let Some(session) = self.active_session() {
-            let repo_count = session.repos.len();
-            let rows = session
+            let entries = session
                 .repos
                 .iter()
                 .map(|repo| {
                     let kind = self.repo_kind(repo);
-                    let marker = match kind {
-                        "missing" => (SELECTED, theme.error),
-                        "worktree" => (WORKTREE, theme.accent),
-                        _ => (SELECTED, theme.success),
-                    };
-                    row(
-                        Some(marker),
-                        &repo.name,
-                        &match repo.local_branch.as_deref() {
+                    Entry::Item(Item {
+                        names: Vec::new(),
+                        italic: false,
+                        marker: Some(match kind {
+                            "missing" => (MISSING, theme.key),
+                            "worktree" => (WORKTREE, theme.key),
+                            _ => (SELECTED, theme.key),
+                        }),
+                        name: repo.name.clone(),
+                        meta: match repo.local_branch.as_deref() {
                             Some(branch) => format!("{kind} · {branch}"),
                             None => kind.to_string(),
                         },
-                        area.width,
-                    )
+                        sub: display_path(Path::new(&repo.path)),
+                        detail: match (&repo.source_repo, &repo.local_branch) {
+                            (Some(source), _) if repo.kind == RepoKind::Worktree => {
+                                display_path(Path::new(source))
+                            }
+                            (_, Some(branch)) if repo.kind != RepoKind::Worktree => branch.clone(),
+                            _ => String::new(),
+                        },
+                    })
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let pointer = if matches!(self.mode, SessionManagerMode::Expanded { .. }) {
+                Pointer::Focus
+            } else {
+                Pointer::Inert
+            };
             let cursor = self.repo_cursor();
-            draw_list(
+            draw_entries(
                 frame,
                 area,
-                rows,
+                &entries,
                 cursor,
-                &mut self.view.branches,
+                true,
+                rows,
                 "No linked repositories — ctrl+a adds repositories",
+                pointer,
+                false,
+                &mut self.view,
             );
-            if matches!(self.mode, SessionManagerMode::Expanded { .. }) {
-                self.view.list_hits(area, repo_count, true, false);
-            }
             return;
         }
         let now = chrono::Utc::now();
-        let rows = visible
-            .iter()
-            .map(|idx| {
-                let session = &self.sessions[*idx];
-                let marker = if self.selected.contains(&session.name) {
-                    (SELECTED, theme.primary)
+        // In the launcher the first section's name is the list heading, so
+        // only later sections get a heading of their own.
+        let launcher = self.launcher_visible();
+        let mut entries = Vec::new();
+        let mut section = None;
+        for idx in visible {
+            let session = &self.sessions[*idx];
+            let group = recency_group(&session.updated_at, now);
+            if section != Some(group) {
+                if !(launcher && section.is_none()) {
+                    entries.push(Entry::Heading(group.to_string()));
+                }
+                section = Some(group);
+            }
+            entries.push(Entry::Item(Item {
+                marker: Some(if self.selected.contains(&session.name) {
+                    (SELECTED, theme.key)
                 } else {
                     (UNSELECTED, theme.muted)
-                };
-                let repos = count_label(session.repos.len(), "repo", "repos");
-                let metadata = match age(&session.updated_at, now) {
-                    Some(age) => format!("{repos} · {age}"),
-                    None => repos,
-                };
-                row(Some(marker), &session.name, &metadata, area.width)
-            })
-            .collect();
-        draw_list(
+                }),
+                name: session.name.clone(),
+                meta: age(&session.updated_at, now).unwrap_or_default(),
+                sub: "no repositories".into(),
+                names: session.repos.iter().map(|repo| repo.name.clone()).collect(),
+                detail: session.description.clone().unwrap_or_default(),
+                italic: true,
+            }));
+        }
+        let pointer = if matches!(self.mode, SessionManagerMode::Browse) {
+            Pointer::Select
+        } else {
+            Pointer::Inert
+        };
+        let cursor = self.cursor;
+        draw_entries(
             frame,
             area,
+            &entries,
+            cursor,
+            false,
             rows,
-            self.cursor,
-            &mut self.view.list,
             "No matching sessions — esc clears the filter",
+            pointer,
+            launcher,
+            &mut self.view,
         );
-        if matches!(self.mode, SessionManagerMode::Browse) {
-            self.view.list_hits(area, visible.len(), false, true);
-        }
     }
 
     fn removal_text(&self, session_names: &[String]) -> String {
+        let location = display_path(&self.store.paths().collection_root);
         let retained: Vec<String> = session_names
             .iter()
             .filter_map(|name| self.sessions.iter().find(|s| &s.name == name))
             .flat_map(|session| session.repos.iter())
             .filter(|repo| repo.kind == RepoKind::Worktree)
-            .map(|repo| repo.path.clone())
+            .map(|repo| display_path(Path::new(&repo.path)))
             .collect();
-        let keep = if retained.is_empty() {
-            "Source repositories stay untouched.".to_string()
+        let mut text = format!(
+            "# Deletes\nThe session metadata and workspace links of {}.\n\n# Keeps\nSource repositories in {location}.",
+            count_label(session_names.len(), "session", "sessions")
+        );
+        if !retained.is_empty() {
+            text.push_str("\nThese managed worktrees stay on disk:");
+            for path in retained {
+                text.push_str(&format!("\n{path}"));
+            }
+        }
+        let visible = self
+            .filtered_indices()
+            .iter()
+            .map(|idx| self.sessions[*idx].name.clone())
+            .collect::<BTreeSet<_>>();
+        let hidden = session_names
+            .iter()
+            .filter(|name| !visible.contains(*name))
+            .count();
+        if hidden > 0 {
+            text.push_str(&format!(
+                "\n\n# Targets\n({hidden} hidden by the current filter)"
+            ));
         } else {
-            format!(
-                "Source repositories stay untouched. These managed worktrees stay on disk and are not deleted:\n{}",
-                retained.join("\n")
-            )
-        };
-        format!(
-            "Delete {}?\n\nThe session metadata and workspace links are deleted.\n{keep}\n\nTargets:\n{}",
-            count_label(session_names.len(), "session", "sessions"),
-            session_names.join("\n")
-        )
+            text.push_str("\n\n# Targets");
+        }
+        for name in session_names {
+            text.push_str(&format!("\n{name}"));
+        }
+        text
     }
 
     fn repo_removal_text(&self, session_name: &str, repo_name: &str) -> String {
@@ -1791,14 +2744,15 @@ impl SessionManagerApp {
             .find(|s| s.name == session_name)
             .and_then(|s| s.repos.iter().find(|r| r.name == repo_name))
             .filter(|r| r.kind == RepoKind::Worktree)
-            .map(|r| r.path.clone());
-        let outcome = match worktree {
+            .map(|r| display_path(Path::new(&r.path)));
+        match worktree {
             Some(path) => format!(
-                "The managed worktree at {path} is deleted only if it is clean, unshared and verified. Otherwise it is kept and the result says why."
+                "# Removes\nThe link to {repo_name} in {session_name}'s workspace.\n\n# Worktree\n{path} is deleted only if it is clean, unshared and verified. Otherwise it is kept and the result says why."
             ),
-            None => "The session link is removed. Source repositories stay untouched.".to_string(),
-        };
-        format!("Remove {repo_name} from {session_name}?\n\n{outcome}")
+            None => format!(
+                "# Removes\nThe link to {repo_name} in {session_name}'s workspace.\n\n# Keeps\nThe source repository."
+            ),
+        }
     }
 
     fn repo_kind(&self, repo: &RepoLink) -> &'static str {
@@ -1812,7 +2766,12 @@ impl SessionManagerApp {
     }
 
     fn item_details(&self) -> Details {
-        let Some(session) = self.display_session() else {
+        self.item_details_in(&self.filtered_indices())
+    }
+
+    /// Details for the focused item, given the already filtered `visible` list.
+    fn item_details_in(&self, visible: &[usize]) -> Details {
+        let Some(session) = self.display_session_in(visible) else {
             return Details {
                 title: if self.sessions.is_empty() {
                     "Your first session"
@@ -1901,7 +2860,12 @@ impl SessionManagerApp {
     }
 
     fn details(&self) -> String {
-        format!("{}\n\n{}", self.item_details().text(), self.message)
+        format!(
+            "{}\n\n{}\n\n{}",
+            self.message,
+            self.open_details,
+            self.item_details().text()
+        )
     }
 
     fn input_key(&mut self, event: Event) -> Option<KeyEvent> {
@@ -1959,6 +2923,43 @@ impl SessionManagerApp {
                 self.mode = SessionManagerMode::Browse;
             }
             return SessionManagerSignal::Continue;
+        }
+        if self.opening.is_some() {
+            return SessionManagerSignal::Continue;
+        }
+        if self.open_dialog.is_some() {
+            self.handle_open_key(key);
+            return SessionManagerSignal::Continue;
+        }
+        if matches!(
+            self.mode,
+            SessionManagerMode::Browse | SessionManagerMode::Expanded { .. }
+        ) {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('o' | 't'))
+            {
+                self.start_open_dialog(key.code == KeyCode::Char('t'));
+                return SessionManagerSignal::Continue;
+            }
+            if key.code == KeyCode::Enter {
+                match Config::load(self.store.paths()) {
+                    Ok(config)
+                        if config
+                            .open
+                            .opener
+                            .is_some_and(|opener| opener != Opener::Editor) =>
+                    {
+                        self.start_open_dialog(false);
+                        self.handle_open_key(key);
+                        return SessionManagerSignal::Continue;
+                    }
+                    Err(error) => {
+                        self.message = format!("Error: {error:#}");
+                        return SessionManagerSignal::Continue;
+                    }
+                    _ => {}
+                }
+            }
         }
         if matches!(
             self.mode,
@@ -2019,6 +3020,7 @@ impl SessionManagerApp {
                 }
             }
             KeyCode::Right => self.expand_current_session(),
+            KeyCode::Tab => self.launcher = !self.launcher,
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 return SessionManagerSignal::New;
             }
@@ -2448,7 +3450,11 @@ impl SessionManagerApp {
     }
 
     fn current_session(&self) -> Option<&SessionMetadata> {
-        self.filtered_indices()
+        self.current_session_in(&self.filtered_indices())
+    }
+
+    fn current_session_in(&self, visible: &[usize]) -> Option<&SessionMetadata> {
+        visible
             .get(self.cursor)
             .and_then(|idx| self.sessions.get(*idx))
     }
@@ -2464,8 +3470,9 @@ impl SessionManagerApp {
         }
     }
 
-    fn display_session(&self) -> Option<&SessionMetadata> {
-        self.active_session().or_else(|| self.current_session())
+    fn display_session_in(&self, visible: &[usize]) -> Option<&SessionMetadata> {
+        self.active_session()
+            .or_else(|| self.current_session_in(visible))
     }
 
     fn target_session_names(&self) -> Vec<String> {
@@ -2550,12 +3557,21 @@ impl SessionManagerApp {
             .unwrap_or(0);
     }
 
+    /// Matching sessions, most recently updated first.
     fn filtered_indices(&self) -> Vec<usize> {
-        self.sessions
+        let query = self.filter.trim().to_lowercase();
+        let mut indices = self
+            .sessions
             .iter()
             .enumerate()
-            .filter_map(|(idx, session)| session_matches(&self.filter, session).then_some(idx))
-            .collect()
+            .filter_map(|(idx, session)| session_matches_lowered(&query, session).then_some(idx))
+            .collect::<Vec<_>>();
+        indices.sort_by(|a, b| {
+            self.sessions[*b]
+                .updated_at
+                .cmp(&self.sessions[*a].updated_at)
+        });
+        indices
     }
 }
 
@@ -2600,25 +3616,26 @@ fn rollback_created_worktrees(paths: &[std::path::PathBuf]) -> Option<String> {
     })
 }
 
-fn session_matches(query: &str, session: &SessionMetadata) -> bool {
-    let query = query.trim();
+/// Whether `session` matches `query`, which is already trimmed and lowercase.
+/// The name, description and every repository name and path are searched as
+/// one lowercase text without building it.
+fn session_matches_lowered(query: &str, session: &SessionMetadata) -> bool {
     if query.is_empty() {
         return true;
     }
-
-    let mut haystack = session.name.clone();
-    if let Some(description) = &session.description {
-        haystack.push(' ');
-        haystack.push_str(description);
-    }
-    for repo in &session.repos {
-        haystack.push(' ');
-        haystack.push_str(&repo.name);
-        haystack.push(' ');
-        haystack.push_str(&repo.path);
-    }
-
-    fuzzy_subsequence(&query.to_lowercase(), &haystack.to_lowercase())
+    let mut haystack = std::iter::once(session.name.as_str())
+        .chain(session.description.as_deref())
+        .chain(
+            session
+                .repos
+                .iter()
+                .flat_map(|repo| [repo.name.as_str(), repo.path.as_str()]),
+        )
+        .flat_map(|part| part.chars().chain(std::iter::once(' ')))
+        .flat_map(char::to_lowercase);
+    query
+        .chars()
+        .all(|needle| haystack.any(|hay| hay == needle))
 }
 
 fn fuzzy_text_matches(query: &str, text: &str) -> bool {
@@ -2694,6 +3711,10 @@ struct View {
     commands: Vec<PaletteCommand>,
     palette: Option<Palette>,
     toast: Option<String>,
+    /// Whether the last frame drew an animation that wants another frame.
+    animating: bool,
+    /// The first row a toast may cover without hiding status or inputs.
+    toast_top: u16,
 }
 
 impl View {
@@ -2745,9 +3766,11 @@ impl View {
                 // Coalesce fast repeated action clicks, including across a dialog transition.
                 self.last_click = None;
                 let now = Instant::now();
-                let navigation = matches!(key.code, KeyCode::Esc | KeyCode::F(1) | KeyCode::F(2))
-                    || (key.code == KeyCode::Char('p')
-                        && key.modifiers.contains(KeyModifiers::CONTROL));
+                let navigation = matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::F(1) | KeyCode::F(2) | KeyCode::Char('1'..='3' | ' ')
+                ) || (key.code == KeyCode::Char('p')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
                 if !navigation
                     && self
                         .last_action
@@ -2783,34 +3806,6 @@ impl View {
         }
     }
 
-    fn list_hits(&mut self, area: Rect, len: usize, branches: bool, selectable: bool) {
-        let offset = if branches {
-            self.branches.offset()
-        } else {
-            self.list.offset()
-        };
-        self.scroll_area = area;
-        for (line, index) in (offset..len).take(area.height as usize).enumerate() {
-            let y = area.y + line as u16;
-            self.hits.push(HitRegion {
-                area: Rect::new(area.x, y, area.width, 1),
-                target: HitTarget::Row {
-                    index,
-                    checkbox: false,
-                },
-            });
-            if selectable {
-                self.hits.push(HitRegion {
-                    area: Rect::new(area.x + 1, y, 3, 1),
-                    target: HitTarget::Row {
-                        index,
-                        checkbox: true,
-                    },
-                });
-            }
-        }
-    }
-
     /// Adds a view's "Key Label" hints to the command palette under `category`.
     fn register(&mut self, hints: &str, category: &'static str) {
         for action in hints.split("  ").filter(|action| !action.is_empty()) {
@@ -2840,7 +3835,7 @@ impl View {
 
     fn draw_toast(&mut self, frame: &mut ratatui::Frame<'_>) {
         if let Some(message) = self.toast.take()
-            && let Some(area) = draw_toast(frame, &message, Theme::new())
+            && let Some(area) = draw_toast(frame, &message, self.toast_top, Theme::new())
         {
             self.hits.push(HitRegion {
                 area,
@@ -2849,13 +3844,78 @@ impl View {
         }
     }
 
-    /// A scrollable text dialog. With buttons, the focused button is the Enter
-    /// default and `hint` explains the other keys on the button row.
+    /// Rows a dialog footer takes: a divider and three-row buttons when the
+    /// screen is tall enough, otherwise one row of chips.
+    fn footer_rows(screen: Rect) -> u16 {
+        if screen.height >= 20 { 4 } else { 1 }
+    }
+
+    /// Draws right-aligned buttons at the bottom of `content`, with `hint` on
+    /// the left, and makes each button clickable.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_footer(
+        &mut self,
+        frame: &mut ratatui::Frame<'_>,
+        drawn: DialogFrame,
+        rows: u16,
+        buttons: &[Button<'_>],
+        keys: &[KeyEvent],
+        hint: &str,
+        theme: Theme,
+    ) {
+        let content = drawn.content;
+        if buttons.is_empty() || content.height < rows {
+            return;
+        }
+        let tall = rows >= 4;
+        let height = if tall { 3 } else { 1 };
+        let row = Rect::new(content.x, content.bottom() - height, content.width, height);
+        if tall {
+            let divider = row.y - 1;
+            for x in drawn.outer.x + 1..drawn.outer.right() - 1 {
+                frame.render_widget(
+                    Paragraph::new("─").style(theme.border),
+                    Rect::new(x, divider, 1, 1),
+                );
+            }
+        }
+        let widths = buttons
+            .iter()
+            .map(|button| button_width(button, tall))
+            .collect::<Vec<_>>();
+        let total = widths.iter().sum::<u16>() + 2 * (buttons.len() as u16 - 1);
+        let mut x = row.right().saturating_sub(total).max(row.x);
+        let first = x;
+        for ((button, key), width) in buttons.iter().zip(keys).zip(widths) {
+            let width = width.min(row.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            let rect = Rect::new(x, row.y, width, height);
+            draw_button(frame, rect, button, theme);
+            self.hits.push(HitRegion {
+                area: rect,
+                target: HitTarget::Key(*key),
+            });
+            x += width + 2;
+        }
+        let room = first.saturating_sub(row.x + 2);
+        if !hint.is_empty() && Line::raw(hint).width() as u16 <= room {
+            frame.render_widget(
+                Paragraph::new(hint).style(theme.muted),
+                Rect::new(row.x, row.y + height / 2, room, 1),
+            );
+        }
+    }
+
+    /// A scrollable text dialog with optional buttons. The first button that
+    /// is `strong` is what Enter does.
     #[allow(clippy::too_many_arguments)]
     fn text_dialog(
         &mut self,
         frame: &mut ratatui::Frame<'_>,
         title: &str,
+        description: &str,
         text: &str,
         style: TextStyle,
         buttons: &[Button<'_>],
@@ -2864,25 +3924,26 @@ impl View {
     ) {
         let theme = Theme::new();
         let screen = frame.area();
-        let preferred = if buttons.is_empty() { 76 } else { 60 };
+        let preferred = if buttons.is_empty() { 78 } else { 66 };
         let width = dialog_width(screen, preferred);
-        let lines = styled_text(
-            text,
-            style,
-            width.saturating_sub(dialog_padding(width) * 2) as usize,
-            theme,
-        );
-        let footer = if buttons.is_empty() { 0 } else { 2 };
-        let body = (lines.len() as u16).saturating_add(footer);
-        let text_rows = body
-            .min(screen.height.saturating_sub(2 + DIALOG_CHROME))
-            .saturating_sub(footer);
-        let aside = if lines.len() as u16 > text_rows {
-            "↑↓ scroll"
+        let pad = if width >= 40 { 3 } else { 2 };
+        let lines = styled_text(text, style, width.saturating_sub(pad * 2) as usize, theme);
+        let footer = if buttons.is_empty() {
+            0
         } else {
-            ""
+            Self::footer_rows(screen)
         };
-        let drawn = dialog(frame, preferred, body, title, aside, theme);
+        let body = (lines.len() as u16).saturating_add(footer);
+        let fits = body
+            <= screen
+                .height
+                .saturating_sub(dialog_chrome(!description.is_empty()));
+        let description = if fits || !description.is_empty() {
+            description.to_owned()
+        } else {
+            "↑↓ scroll".to_owned()
+        };
+        let drawn = dialog(frame, preferred, body, title, &description, theme);
         let content = drawn.content;
         let text_area = Rect::new(
             content.x,
@@ -2900,32 +3961,7 @@ impl View {
             area: drawn.close,
             target: HitTarget::Key(key_event(KeyCode::Esc, KeyModifiers::NONE)),
         });
-        if buttons.is_empty() || content.height == 0 {
-            return;
-        }
-        let row = Rect::new(content.x, content.bottom() - 1, content.width, 1);
-        let areas = draw_buttons(frame, row, buttons, theme);
-        let first = areas
-            .iter()
-            .filter(|area| area.width > 0)
-            .map(|area| area.x)
-            .min()
-            .unwrap_or(row.right());
-        let room = first.saturating_sub(row.x + 2);
-        if !hint.is_empty() && Line::raw(hint).width() as u16 <= room {
-            frame.render_widget(
-                Paragraph::new(hint).style(theme.muted),
-                Rect::new(row.x, row.y, room, 1),
-            );
-        }
-        for (area, key) in areas.into_iter().zip(keys) {
-            if area.width > 0 {
-                self.hits.push(HitRegion {
-                    area,
-                    target: HitTarget::Key(*key),
-                });
-            }
-        }
+        self.draw_footer(frame, drawn, footer, buttons, keys, hint, theme);
     }
 
     /// A one-field dialog, such as renaming a session.
@@ -2933,11 +3969,12 @@ impl View {
         &mut self,
         frame: &mut ratatui::Frame<'_>,
         title: &str,
-        value: &str,
-        placeholder: &str,
+        description: &str,
+        field: &Field<'_>,
     ) {
         let theme = Theme::new();
-        let drawn = dialog(frame, 60, 3, title, "", theme);
+        let footer = Self::footer_rows(frame.area());
+        let drawn = dialog(frame, 66, 5 + footer, title, description, theme);
         let content = drawn.content;
         self.block_click_through();
         self.hits.push(HitRegion {
@@ -2947,36 +3984,42 @@ impl View {
         if content.height == 0 {
             return;
         }
-        let field = Rect::new(content.x, content.y, content.width, 1);
-        frame.render_widget(
-            Block::default().style(theme.base.patch(theme.element)),
-            field,
-        );
+        let rows = content.height.saturating_sub(footer).min(4);
         draw_field(
             frame,
-            Rect::new(field.x + 1, field.y, field.width.saturating_sub(2), 1),
-            value,
-            placeholder,
-            true,
+            Rect::new(content.x, content.y, content.width, rows),
+            field,
             theme,
         );
-        if content.height >= 3 {
-            let label = Line::from(vec![
-                Span::styled("enter", theme.key),
-                Span::styled(" save", theme.muted),
-            ]);
-            let width = (label.width() as u16).min(content.width);
-            let area = Rect::new(content.right() - width, content.y + 2, width, 1);
-            frame.render_widget(Paragraph::new(label), area);
-            self.hits.push(HitRegion {
-                area,
-                target: HitTarget::Key(key_event(KeyCode::Enter, KeyModifiers::NONE)),
-            });
-        }
+        self.draw_footer(
+            frame,
+            drawn,
+            footer,
+            &[
+                Button {
+                    icon: "",
+                    label: "Cancel",
+                    key: "esc",
+                    strong: false,
+                },
+                Button {
+                    icon: "✓",
+                    label: "Save",
+                    key: "enter",
+                    strong: true,
+                },
+            ],
+            &[
+                key_event(KeyCode::Esc, KeyModifiers::NONE),
+                key_event(KeyCode::Enter, KeyModifiers::NONE),
+            ],
+            "",
+            theme,
+        );
     }
 
-    /// OpenCode's command palette: a search field, purple category headings
-    /// and rows with right-aligned shortcuts; focus is a full-width bar.
+    /// The command palette: a search field, uppercase category headings and
+    /// rows with right-aligned shortcuts; focus is a full-width bar.
     fn draw_palette(&mut self, frame: &mut ratatui::Frame<'_>) {
         let Some(palette) = &mut self.palette else {
             return;
@@ -3006,8 +4049,8 @@ impl View {
             }
             rows.push(PaletteRow::Item(index));
         }
-        let body = 2 + rows.len().max(1) as u16;
-        let drawn = dialog(frame, 60, body, "Commands", "", theme);
+        let body = 4 + rows.len().max(1) as u16;
+        let drawn = dialog(frame, 64, body, "Commands", "", theme);
         let content = drawn.content;
         self.hits.retain(|hit| {
             matches!(hit.target, HitTarget::Key(key)
@@ -3022,22 +4065,28 @@ impl View {
         if content.height == 0 {
             return;
         }
+        let field_rows = if content.height >= 6 { 3 } else { 1 };
         draw_field(
             frame,
-            Rect::new(content.x, content.y, content.width, 1),
-            &palette.query,
-            "Search",
-            true,
+            Rect::new(content.x, content.y, content.width, field_rows),
+            &Field {
+                label: "",
+                aside: "",
+                value: &palette.query,
+                placeholder: "Search commands",
+                editable: true,
+            },
             theme,
         );
+        let top = (content.y + field_rows + 1).min(content.bottom());
         let list = Rect::new(
             drawn.outer.x + 1,
-            content.y + 2.min(content.height),
+            top,
             drawn.outer.width.saturating_sub(2),
-            content.height.saturating_sub(2),
+            content.bottom().saturating_sub(top),
         );
         self.scroll_area = list;
-        let inset = dialog_padding(drawn.outer.width) - 1;
+        let inset = content.x.saturating_sub(list.x);
         let text_width = list.width.saturating_sub(inset * 2) as usize;
         if commands.is_empty() {
             if list.height > 0 {
@@ -3073,7 +4122,7 @@ impl View {
             match entry {
                 PaletteRow::Blank => {}
                 PaletteRow::Heading(name) => frame.render_widget(
-                    Paragraph::new(*name).style(theme.accent),
+                    Paragraph::new(heading(name, theme)),
                     Rect::new(list.x + inset, area.y, text_width as u16, 1),
                 ),
                 PaletteRow::Item(index) => {
@@ -3087,7 +4136,7 @@ impl View {
                     let gap = text_width.saturating_sub(Line::raw(&label).width() + shortcut_width);
                     let (label_style, key_style) = if *index == palette.cursor {
                         frame.render_widget(Block::default().style(theme.focus), area);
-                        (theme.focus, theme.focus.remove_modifier(Modifier::BOLD))
+                        (theme.focus, theme.focus_soft)
                     } else {
                         (theme.key, theme.muted)
                     };
@@ -3216,9 +4265,36 @@ impl View {
             } else {
                 TextStyle::Fields
             };
-            self.text_dialog(frame, &title, &text, style, &[], &[], "");
+            self.text_dialog(frame, &title, "", &text, style, &[], &[], "");
         }
         self.draw_palette(frame);
+    }
+}
+
+/// The folder each repository sits in, relative to the collection root.
+fn repo_groups(repos: &[RepoCandidate], root: &Path) -> Vec<String> {
+    repos
+        .iter()
+        .map(|repo| {
+            repo.path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(root).ok())
+                .map(|relative| relative.display().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Copies the overlapping region of a saved screen into `buffer`, so a
+/// backdrop survives a resize.
+fn copy_backdrop(buffer: &mut ratatui::buffer::Buffer, backdrop: &ratatui::buffer::Buffer) {
+    let area = buffer.area.intersection(backdrop.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let (Some(from), Some(to)) = (backdrop.cell((x, y)), buffer.cell_mut((x, y))) {
+                to.clone_from(from);
+            }
+        }
     }
 }
 
@@ -3231,12 +4307,14 @@ fn present_paths(sessions: &[SessionMetadata]) -> BTreeSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 struct Input<'a> {
     placeholder: &'a str,
     value: &'a str,
     editable: bool,
 }
 
+#[cfg(test)]
 impl<'a> Input<'a> {
     fn new(placeholder: &'a str, value: &'a str) -> Self {
         Self {
@@ -3245,19 +4323,11 @@ impl<'a> Input<'a> {
             editable: true,
         }
     }
-
-    fn readonly(placeholder: &'a str, value: &'a str) -> Self {
-        Self {
-            placeholder,
-            value,
-            editable: false,
-        }
-    }
 }
 
 #[cfg(test)]
 fn draw_input(frame: &mut ratatui::Frame<'_>, area: Rect, input: Input<'_>, theme: Theme) {
-    draw_field(
+    chrome::draw_input(
         frame,
         area,
         input.value,
@@ -3267,184 +4337,375 @@ fn draw_input(frame: &mut ratatui::Frame<'_>, area: Rect, input: Input<'_>, them
     );
 }
 
-/// What one view asks the shared frame to draw.
-struct Screen<'a> {
-    title: &'a str,
-    subtitle: &'a str,
-    mode: &'a str,
-    bar: Style,
-    input: Input<'a>,
-    status: &'a str,
-    hints: &'a str,
-    message: &'a str,
-    location: &'a str,
-    /// Shows the logo home with this hint-formatted tip instead of a list.
-    home: Option<&'a str>,
+/// Actions every view offers through the command palette.
+const GLOBAL_ACTIONS: &str = "Ctrl+C Quit  F1 Help  F2 Details";
+const UNSELECTED: &str = "○";
+const SELECTED: &str = "●";
+const WORKTREE: &str = "◆";
+const MISSING: &str = "✕";
+
+/// One action button. `key` uses hint syntax ("Ctrl+N") so it can be clicked.
+#[derive(Clone, Copy)]
+struct Act<'a> {
+    icon: &'a str,
+    label: &'a str,
+    key: &'a str,
+    strong: bool,
 }
 
+impl<'a> Act<'a> {
+    const fn new(icon: &'a str, label: &'a str, key: &'a str) -> Self {
+        Self {
+            icon,
+            label,
+            key,
+            strong: false,
+        }
+    }
+
+    const fn strong(icon: &'a str, label: &'a str, key: &'a str) -> Self {
+        Self {
+            icon,
+            label,
+            key,
+            strong: true,
+        }
+    }
+}
+
+const COMMANDS: Act<'static> = Act::new("›", "Commands", "Ctrl+P");
+
+/// Where a view's list and optional sidebar landed.
 struct Surface {
     list: Rect,
     preview: Option<Rect>,
 }
 
-/// Actions every view offers through the command palette.
-const GLOBAL_ACTIONS: &str = "Ctrl+C Quit  F1 Help  F2 Details";
-const SIDEBAR_WIDTH: u16 = 42;
-const UNSELECTED: &str = "○";
-const SELECTED: &str = "●";
-const WORKTREE: &str = "◆";
-
-/// Draws the OpenCode-style frame: a header, the content column, the prompt box
-/// with its mode/status line, the hint line and, when wide, a raised sidebar.
-fn shell(frame: &mut ratatui::Frame<'_>, screen: Screen<'_>, view: &mut View) -> Option<Surface> {
+/// The work every frame starts with: reset hit regions and palette commands,
+/// queue feedback for the toast and paint the page. Returns `None` when the
+/// terminal is below the supported size.
+fn begin(frame: &mut ratatui::Frame<'_>, hints: &str, message: &str, view: &mut View) -> bool {
     let area = frame.area();
     let theme = Theme::new();
     view.hits.clear();
     view.commands.clear();
     view.scroll_area = Rect::default();
-    view.toast = (!screen.message.is_empty()).then(|| screen.message.to_owned());
+    view.toast = (!message.is_empty()).then(|| message.to_owned());
+    view.toast_top = 1;
     frame.render_widget(Block::default().style(theme.base), area);
     if area.width < 40 || area.height < 12 {
         view.toast = None;
         draw_too_small(frame, area, theme, view);
-        return None;
+        return false;
     }
-    view.register(screen.hints, "Suggested");
+    view.register(hints, "Suggested");
     view.register(GLOBAL_ACTIONS, "System");
-    if let Some(tip) = screen.home {
-        draw_home(frame, area, &screen, tip, theme, view);
-        return Some(Surface {
-            list: Rect::default(),
-            preview: None,
-        });
-    }
-    let sidebar = (area.width >= 100 && area.height >= 20).then(|| {
-        Rect::new(
-            area.right() - SIDEBAR_WIDTH,
-            area.y,
-            SIDEBAR_WIDTH,
-            area.height,
-        )
-    });
-    let main_width = area.width - sidebar.map_or(0, |sidebar| sidebar.width);
-    let pad = if main_width >= 60 { 2 } else { 1 };
-    let column = Rect::new(area.x + pad, area.y, main_width - pad * 2, area.height);
-    let gap = u16::from(area.height >= 16);
-    let rows = Layout::vertical([
-        Constraint::Length(u16::from(area.height >= 20)),
-        Constraint::Length(1),
-        Constraint::Length(gap),
-        Constraint::Min(1),
-        Constraint::Length(gap),
-        Constraint::Length(prompt_height(area)),
-        Constraint::Length(1),
-    ])
-    .split(column);
-    let mut header = vec![Span::styled(screen.title.to_owned(), theme.title)];
-    if !screen.subtitle.is_empty() {
-        header.push(Span::styled(format!(" · {}", screen.subtitle), theme.muted));
-    }
-    frame.render_widget(
-        Paragraph::new(clip_line(Line::from(header), column.width as usize)),
-        rows[1],
-    );
-    draw_prompt(
-        frame,
-        rows[5],
-        PromptBox {
-            value: screen.input.value,
-            placeholder: screen.input.placeholder,
-            editable: screen.input.editable,
-            mode: screen.mode,
-            status: screen.status,
-            bar: screen.bar,
-        },
-        theme,
-    );
-    draw_hint_line(frame, rows[6], screen.location, screen.hints, theme, view);
-    if let Some(sidebar) = sidebar {
-        frame.render_widget(
-            Block::default().style(theme.base.patch(theme.surface)),
-            sidebar,
-        );
-    }
-    Some(Surface {
-        list: rows[3],
-        preview: sidebar,
-    })
+    true
 }
 
-/// The empty-state home: centered logo, a tip, the prompt and the hint line,
-/// with the version in the bottom-right corner.
-fn draw_home(
+/// How many rows list items take: one, two or three, by screen height.
+fn item_rows(screen: Rect) -> u16 {
+    Scale::new(screen).item_rows()
+}
+
+/// Buttons in a row, left to right. The last action (Commands) is always
+/// kept so every other action stays reachable through the palette.
+fn draw_action_bar(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    screen: &Screen<'_>,
-    tip: &str,
+    acts: &[Act<'_>],
     theme: Theme,
     view: &mut View,
 ) {
-    let width = 75.min(area.width.saturating_sub(4));
-    let x = area.x + (area.width - width) / 2;
-    let prompt_rows = prompt_height(area);
-    let with_logo = area.height >= LOGO_HEIGHT + prompt_rows + 8;
-    let block = if with_logo { LOGO_HEIGHT + 1 } else { 0 } + 2 + prompt_rows + 1;
-    let mut y = area.y + area.height.saturating_sub(block) / 2;
-    if with_logo {
-        frame.render_widget(
-            Paragraph::new(logo_lines(theme)),
-            Rect::new(
-                area.x + area.width.saturating_sub(LOGO_WIDTH) / 2,
-                y,
-                LOGO_WIDTH.min(area.width),
-                LOGO_HEIGHT,
-            ),
-        );
-        y += LOGO_HEIGHT + 1;
+    if acts.is_empty() || area.height == 0 {
+        return;
     }
-    let (key, rest) = tip.split_once(' ').unwrap_or((tip, ""));
-    let line = Line::from(vec![
-        Span::styled(display_key(key), theme.primary),
-        Span::styled(format!(" {rest}"), theme.muted),
-    ]);
-    let tip_width = (line.width() as u16).min(area.width);
-    let tip_area = Rect::new(area.x + (area.width - tip_width) / 2, y, tip_width, 1);
-    frame.render_widget(Paragraph::new(line), tip_area);
-    if let Some(event) = action_key(key) {
-        view.hits.push(HitRegion {
-            area: tip_area,
-            target: HitTarget::Key(event),
-        });
+    let tall = area.height >= 3;
+    let widths = acts
+        .iter()
+        .map(|act| {
+            let key = display_key(act.key);
+            button_width(&act_button(act, &key, tall), tall)
+        })
+        .collect::<Vec<_>>();
+    let last = acts.len() - 1;
+    let mut budget = area.width.saturating_sub(widths[last]);
+    let mut chosen = Vec::new();
+    for (index, width) in widths.iter().enumerate().take(last) {
+        if width + 2 > budget {
+            break;
+        }
+        budget -= width + 2;
+        chosen.push(index);
     }
-    y += 2;
-    draw_prompt(
-        frame,
-        Rect::new(x, y, width, prompt_rows),
-        PromptBox {
-            value: screen.input.value,
-            placeholder: screen.input.placeholder,
-            editable: screen.input.editable,
-            mode: screen.mode,
-            status: screen.status,
-            bar: screen.bar,
-        },
-        theme,
+    chosen.push(last);
+    let mut x = area.x;
+    for index in chosen {
+        let act = &acts[index];
+        let width = widths[index].min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        let key = display_key(act.key);
+        let rect = Rect::new(x, area.y, width, if tall { 3 } else { 1 });
+        draw_button(frame, rect, &act_button(act, &key, tall), theme);
+        if let Some(event) = action_key(act.key) {
+            view.hits.push(HitRegion {
+                area: rect,
+                target: HitTarget::Key(event),
+            });
+        }
+        x += width + 2;
+    }
+}
+
+fn act_button<'a>(act: &Act<'a>, key: &'a str, tall: bool) -> Button<'a> {
+    Button {
+        icon: if tall { act.icon } else { "" },
+        label: act.label,
+        key,
+        strong: act.strong,
+    }
+}
+
+/// A breadcrumb such as "dws / api-review / Repositories" with optional
+/// muted status on the right.
+fn draw_crumbs(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    crumbs: &[&str],
+    status: &str,
+    theme: Theme,
+) {
+    let mut spans = Vec::new();
+    for (index, crumb) in crumbs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" / ", theme.border));
+        }
+        spans.push(Span::styled(
+            (*crumb).to_owned(),
+            if index + 1 == crumbs.len() {
+                theme.title
+            } else {
+                theme.muted
+            },
+        ));
+    }
+    let status_width = Line::raw(status).width() as u16;
+    let room = area.width.saturating_sub(status_width + 2);
+    frame.render_widget(
+        Paragraph::new(clip_line(Line::from(spans), room as usize)),
+        Rect::new(area.x, area.y, room, 1),
     );
-    draw_hint_line(
+    if !status.is_empty() && status_width < area.width {
+        frame.render_widget(
+            Paragraph::new(status).style(theme.muted),
+            Rect::new(area.right() - status_width, area.y, status_width, 1),
+        );
+    }
+}
+
+/// What the list layout needs from a view.
+struct Chrome<'a> {
+    crumbs: &'a [&'a str],
+    status: &'a str,
+    field: Field<'a>,
+    acts: &'a [Act<'a>],
+}
+
+/// The dense layout: breadcrumb and status, the list, a labelled field and
+/// an action bar, with a details sidebar on wide terminals.
+fn list_layout(
+    frame: &mut ratatui::Frame<'_>,
+    chrome: &Chrome<'_>,
+    theme: Theme,
+    view: &mut View,
+) -> Surface {
+    let area = frame.area();
+    let scale = Scale::new(area);
+    let sidebar = (area.width >= 100 && area.height >= 20).then(|| {
+        let width = scale.sidebar_width();
+        Rect::new(area.right() - width, area.y, width, area.height)
+    });
+    let main_width = area.width - sidebar.map_or(0, |sidebar| sidebar.width);
+    let pad = scale.page_pad();
+    let column = Rect::new(area.x + pad, area.y, main_width - pad * 2, area.height);
+    let roomy = area.height >= 16;
+    let tall = area.height >= 20;
+    let rows = Layout::vertical([
+        Constraint::Length(u16::from(tall)),
+        Constraint::Length(1),
+        Constraint::Length(u16::from(roomy)),
+        Constraint::Min(1),
+        Constraint::Length(u16::from(roomy)),
+        Constraint::Length(if tall { 4 } else { 3 }),
+        Constraint::Length(u16::from(tall)),
+        Constraint::Length(if area.height >= 24 { 3 } else { 1 }),
+    ])
+    .split(column);
+    draw_crumbs(frame, rows[1], chrome.crumbs, chrome.status, theme);
+    view.toast_top = rows[1].bottom();
+    draw_field(frame, rows[5], &chrome.field, theme);
+    draw_action_bar(frame, rows[7], chrome.acts, theme, view);
+    Surface {
+        list: rows[3],
+        preview: sidebar,
+    }
+}
+
+/// Everything the launcher home needs from the manager.
+struct Launcher<'a> {
+    groups: &'a [chrome::Group],
+    tick: Option<u64>,
+    field: Field<'a>,
+    acts: &'a [Act<'a>],
+    heading: &'a str,
+    aside: &'a str,
+}
+
+/// The launcher home: the constellation (when there is room), the search
+/// field, the main actions as large buttons and a heading for the list.
+/// Returns the list area.
+fn launcher_layout(
+    frame: &mut ratatui::Frame<'_>,
+    launcher: &Launcher<'_>,
+    theme: Theme,
+    view: &mut View,
+) -> Rect {
+    let area = frame.area();
+    let scale = Scale::new(area);
+    let width = scale.launcher_width();
+    let x = area.x + (area.width - width) / 2;
+    let mut y = area.y + 1;
+    let signature = area.height >= 27 && area.width >= chrome::SIGNATURE_WIDTH + 4;
+    if signature {
+        let height = scale.signature_height();
+        chrome::constellation(
+            frame,
+            Rect::new(area.x, y, area.width, height),
+            launcher.groups,
+            launcher.tick,
+            theme,
+        );
+        view.animating = launcher.tick.is_some();
+        y += height + 1;
+    }
+    draw_field(frame, Rect::new(x, y, width, 4), &launcher.field, theme);
+    y += 5;
+    if area.height >= 40 {
+        y += 1;
+    }
+    draw_action_bar(frame, Rect::new(x, y, width, 3), launcher.acts, theme, view);
+    y += 4;
+    // Feedback covers the signature when there is one, else the heading row.
+    if !signature {
+        view.toast_top = y;
+    }
+    let heading_row = Rect::new(x + 2, y, width.saturating_sub(4), 1);
+    frame.render_widget(
+        Paragraph::new(heading(launcher.heading, theme)),
+        heading_row,
+    );
+    let aside_width = Line::raw(launcher.aside).width() as u16;
+    if aside_width < heading_row.width {
+        frame.render_widget(
+            Paragraph::new(launcher.aside).style(theme.muted),
+            Rect::new(heading_row.right() - aside_width, y, aside_width, 1),
+        );
+    }
+    let version = Line::raw(VERSION).width() as u16;
+    frame.render_widget(
+        Paragraph::new(VERSION).style(theme.muted),
+        Rect::new(area.right() - version - 2, area.bottom() - 1, version, 1),
+    );
+    Rect::new(x, y + 1, width, area.bottom().saturating_sub(y + 3))
+}
+
+/// The empty collection: the signature, one next step and help.
+fn draw_first_run(
+    frame: &mut ratatui::Frame<'_>,
+    location: &str,
+    tick: Option<u64>,
+    theme: Theme,
+    view: &mut View,
+) {
+    let area = frame.area();
+    let scale = Scale::new(area);
+    let signature = area.height >= 27 && area.width >= chrome::SIGNATURE_WIDTH + 4;
+    let signature_height = scale.signature_height();
+    // Title, text, buttons and note take eight rows below the signature.
+    let block = 8 + if signature { signature_height + 1 } else { 0 };
+    let mut y = area.y + area.height.saturating_sub(block) / 2;
+    if signature {
+        chrome::constellation(
+            frame,
+            Rect::new(area.x, y, area.width, signature_height),
+            &[],
+            tick,
+            theme,
+        );
+        view.animating = tick.is_some();
+        y += signature_height + 1;
+    }
+    let center = |text: &str| {
+        let width = (Line::raw(text).width() as u16).min(area.width);
+        Rect::new(area.x + (area.width - width) / 2, 0, width, 1)
+    };
+    let title = "Create your first session";
+    frame.render_widget(
+        Paragraph::new(title).style(theme.title),
+        Rect { y, ..center(title) },
+    );
+    let body = format!("Pick repositories from {location}. dws links them into one workspace.");
+    let body = clip(&body, area.width.saturating_sub(4) as usize);
+    frame.render_widget(
+        Paragraph::new(body.as_str()).style(theme.muted),
+        Rect {
+            y: y + 1,
+            ..center(&body)
+        },
+    );
+    let acts = [
+        Act::strong("+", "New session", "Ctrl+N"),
+        Act::new("?", "How dws works", "F1"),
+    ];
+    let tall = area.height >= 16;
+    let total = acts
+        .iter()
+        .map(|act| {
+            let key = display_key(act.key);
+            button_width(
+                &Button {
+                    icon: act.icon,
+                    label: act.label,
+                    key: &key,
+                    strong: act.strong,
+                },
+                tall,
+            )
+        })
+        .sum::<u16>()
+        + 2;
+    draw_action_bar(
         frame,
-        Rect::new(x, y + prompt_rows, width, 1),
-        screen.location,
-        screen.hints,
+        Rect::new(
+            area.x + area.width.saturating_sub(total) / 2,
+            y + 3,
+            total.min(area.width),
+            if tall { 3 } else { 1 },
+        ),
+        &acts,
         theme,
         view,
     );
-    let version = Line::raw(VERSION).width() as u16;
-    if area.width > version + 2 {
-        frame.render_widget(
-            Paragraph::new(VERSION).style(theme.muted),
-            Rect::new(area.right() - version - 2, area.bottom() - 1, version, 1),
-        );
-    }
+    let note = format!("{location} · no sessions yet");
+    frame.render_widget(
+        Paragraph::new(note.as_str()).style(theme.dim),
+        Rect {
+            y: (y + 7).min(area.bottom() - 1),
+            ..center(&note)
+        },
+    );
 }
 
 fn draw_too_small(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme, view: &mut View) {
@@ -3463,14 +4724,14 @@ fn draw_too_small(frame: &mut ratatui::Frame<'_>, area: Rect, theme: Theme, view
     let mut spans = Vec::new();
     let mut x = area.x;
     for (key, label, event) in actions {
-        let width = (key.len() + label.len()) as u16;
+        let width = (key.len() + 2 + label.len()) as u16;
         if x + width <= area.right() && area.height >= 2 {
             view.hits.push(HitRegion {
                 area: Rect::new(x, area.y + 1, width, 1),
                 target: HitTarget::Key(event),
             });
         }
-        spans.push(Span::styled(key, theme.key));
+        spans.push(keycap(key, theme));
         spans.push(Span::styled(format!("{label}  "), theme.muted));
         x += width + 2;
     }
@@ -3514,7 +4775,7 @@ fn describe(label: &str) -> &str {
     }
 }
 
-/// How a shortcut is shown on screen, in OpenCode's lowercase key style.
+/// How a shortcut is shown on screen, in lowercase key style.
 fn display_key(key: &str) -> String {
     match key {
         "Right" => "→".into(),
@@ -3523,80 +4784,16 @@ fn display_key(key: &str) -> String {
     }
 }
 
-/// The line under the prompt: the collection path on the left, then as many
-/// of the view's shortcuts as fit, always ending with the command palette.
-fn draw_hint_line(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    location: &str,
-    hints: &str,
-    theme: Theme,
-    view: &mut View,
-) {
-    let palette = (
-        "ctrl+p".to_string(),
-        "commands".to_string(),
-        Some(key_event(KeyCode::Char('p'), KeyModifiers::CONTROL)),
-    );
-    let width_of = |(key, label, _): &(String, String, Option<KeyEvent>)| {
-        Line::raw(key).width() + 1 + Line::raw(label).width()
-    };
-    // Narrow screens keep key hints and let the path take what is left.
-    let reserve = if location.is_empty() || area.width < 70 {
-        0
-    } else {
-        Line::raw(location).width().min(16) + 2
-    };
-    let mut budget = (area.width as usize).saturating_sub(width_of(&palette) + reserve);
-    let mut chosen = Vec::new();
-    for action in hints.split("  ").filter(|action| !action.is_empty()) {
-        let (key, label) = action.split_once(' ').unwrap_or((action, ""));
-        let item = (display_key(key), label.to_lowercase(), action_key(key));
-        let size = width_of(&item) + 2;
-        if size > budget {
-            break;
-        }
-        budget -= size;
-        chosen.push(item);
-    }
-    chosen.push(palette);
-    let total = chosen.iter().map(width_of).sum::<usize>() + 2 * (chosen.len() - 1);
-    let mut x = area.right().saturating_sub(total as u16).max(area.x);
-    let room = x.saturating_sub(area.x + 2) as usize;
-    if room > 0 {
-        frame.render_widget(
-            Paragraph::new(clip_start(location, room)).style(theme.muted),
-            Rect::new(area.x, area.y, room as u16, 1),
-        );
-    }
-    for item in &chosen {
-        let width = width_of(item) as u16;
-        if x + width > area.right() {
-            break;
-        }
-        let rect = Rect::new(x, area.y, width, 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(item.0.clone(), theme.key),
-                Span::styled(format!(" {}", item.1), theme.muted),
-            ])),
-            rect,
-        );
-        if let Some(event) = item.2 {
-            view.hits.push(HitRegion {
-                area: rect,
-                target: HitTarget::Key(event),
-            });
-        }
-        x += width + 2;
-    }
-}
-
 /// Shortens the user's home directory to `~`.
 fn display_path(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && !home.as_os_str().is_empty()
-        && let Ok(rest) = path.strip_prefix(&home)
+    static HOME: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let home = HOME.get_or_init(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| !home.as_os_str().is_empty())
+    });
+    if let Some(home) = home
+        && let Ok(rest) = path.strip_prefix(home)
     {
         return if rest.as_os_str().is_empty() {
             "~".into()
@@ -3611,6 +4808,7 @@ fn action_key(label: &str) -> Option<KeyEvent> {
     let (code, modifiers) = match label {
         "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
         "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
+        "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
         "Right" => (KeyCode::Right, KeyModifiers::NONE),
         "F1" => (KeyCode::F(1), KeyModifiers::NONE),
         "F2" => (KeyCode::F(2), KeyModifiers::NONE),
@@ -3628,48 +4826,163 @@ fn count_label(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
-/// One list row: two columns of padding, an optional marker, the name and
-/// right-aligned muted metadata. Focus paints the whole row.
-fn row(
+/// One list item: a marker, a bold name, muted metadata on the right, a
+/// supporting second line and an optional third line for tall screens.
+struct Item {
     marker: Option<(&'static str, Style)>,
-    name: &str,
-    metadata: &str,
-    width: u16,
-) -> Line<'static> {
-    let theme = Theme::new();
-    let lead = if marker.is_some() { 4 } else { 2 };
-    let space = (width as usize).saturating_sub(lead + 2);
-    let meta_width = if space >= 26 {
-        Line::raw(metadata).width().min(space / 2)
-    } else {
-        0
-    };
-    let name_width = space.saturating_sub(meta_width + usize::from(meta_width > 0) * 2);
-    let name = clip(name, name_width);
-    let gap = name_width.saturating_sub(Line::raw(&name).width());
-    let mut spans = vec![Span::raw("  ")];
-    if let Some((glyph, style)) = marker {
-        spans.push(Span::styled(glyph, style));
-        spans.push(Span::raw(" "));
-    }
-    spans.push(Span::styled(name, theme.key));
-    if meta_width > 0 {
-        spans.push(Span::raw(" ".repeat(gap + 2)));
-        spans.push(Span::styled(clip(metadata, meta_width), theme.muted));
-    }
-    Line::from(spans)
+    name: String,
+    meta: String,
+    sub: String,
+    /// Names for the second line, fitted whole and ending in "+N"; used
+    /// instead of `sub` when present.
+    names: Vec<String>,
+    detail: String,
+    /// The detail is prose (a description) and is set in italics.
+    italic: bool,
 }
 
-fn draw_list(
+impl Item {
+    /// The rows an item takes when `rows` are on offer: never more than it
+    /// has lines, where the second line always counts.
+    fn height(&self, rows: u16) -> u16 {
+        rows.min(if self.detail.is_empty() { 2 } else { 3 })
+    }
+
+    /// The second line at `width` columns.
+    fn second_line(&self, width: usize) -> String {
+        if self.names.is_empty() {
+            clip(&self.sub, width)
+        } else {
+            fit_names(&self.names, width)
+        }
+    }
+
+    /// Rows the launcher card takes: padding, title, names, the optional
+    /// description and the key hints.
+    fn card_height(&self) -> u16 {
+        5 + u16::from(!self.detail.is_empty())
+    }
+}
+
+/// Whole names separated by two spaces, ending in "+N" for those that do
+/// not fit; never cuts a name in the middle.
+fn fit_names(names: &[String], width: usize) -> String {
+    let mut shown = String::new();
+    for (index, name) in names.iter().enumerate() {
+        let next = if shown.is_empty() {
+            name.clone()
+        } else {
+            format!("{shown}  {name}")
+        };
+        let rest = names.len() - index - 1;
+        let tail = if rest > 0 {
+            format!("  +{rest}")
+        } else {
+            String::new()
+        };
+        if Line::raw(&next).width() + Line::raw(&tail).width() > width {
+            let rest = names.len() - index;
+            let more = format!("+{rest}");
+            return clip(
+                &if shown.is_empty() {
+                    more
+                } else {
+                    format!("{shown}  {more}")
+                },
+                width,
+            );
+        }
+        shown = next;
+    }
+    shown
+}
+
+/// When a session was last updated, as a list section.
+fn recency_group(updated_at: &str, now: chrono::DateTime<chrono::Utc>) -> &'static str {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return "Earlier";
+    };
+    let days = (now - then.with_timezone(&chrono::Utc)).num_hours().max(0) / 24;
+    match days {
+        0 => "Today",
+        1..7 => "This week",
+        7..31 => "This month",
+        _ => "Earlier",
+    }
+}
+
+/// Keys shown on the launcher card, as (key, label, event).
+fn card_hints() -> [(&'static str, &'static str, KeyEvent); 3] {
+    [
+        (
+            "enter",
+            "open",
+            key_event(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+        (
+            "→",
+            "repositories",
+            key_event(KeyCode::Right, KeyModifiers::NONE),
+        ),
+        (
+            "ctrl+e",
+            "rename",
+            key_event(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        ),
+    ]
+}
+
+/// An entry in a list: a section heading or an item.
+enum Entry {
+    Heading(String),
+    Item(Item),
+}
+
+/// What a drawn list lets the pointer do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pointer {
+    /// Rows focus and double-click activates; markers toggle selection.
+    Select,
+    /// Rows focus and double-click activates.
+    Focus,
+    /// Nothing is clickable.
+    Inert,
+}
+
+/// Draws entries with headings and multi-row items, keeps the focused item
+/// in view (the offset counts entries) and registers a click target for
+/// each visible item: the whole item, plus its marker when selectable.
+#[allow(clippy::too_many_arguments)]
+fn draw_entries(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    rows: Vec<Line<'static>>,
+    entries: &[Entry],
     cursor: usize,
-    state: &mut ListState,
+    branches: bool,
+    rows: u16,
     empty: &str,
+    pointer: Pointer,
+    card: bool,
+    view: &mut View,
 ) {
     let theme = Theme::new();
-    if rows.is_empty() {
+    let View {
+        hits,
+        list,
+        branches: branch_state,
+        scroll_area,
+        ..
+    } = view;
+    let state = if branches { branch_state } else { list };
+    if pointer != Pointer::Inert {
+        *scroll_area = area;
+    }
+    let items = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| matches!(entry, Entry::Item(_)).then_some(index))
+        .collect::<Vec<_>>();
+    if items.is_empty() || area.height == 0 {
         state.select(None);
         frame.render_widget(
             Paragraph::new(empty)
@@ -3684,14 +4997,258 @@ fn draw_list(
         );
         return;
     }
-    state.select(Some(cursor.min(rows.len() - 1)));
-    frame.render_stateful_widget(
-        List::new(rows)
-            .highlight_style(theme.focus)
-            .scroll_padding(0),
-        area,
-        state,
+    let focused = cursor != usize::MAX;
+    let cursor = cursor.min(items.len() - 1);
+    state.select(focused.then_some(cursor));
+    let focus = items[cursor];
+    let card = card && focused && rows >= 2;
+    let heights = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| match entry {
+            Entry::Heading(_) => 1,
+            Entry::Item(item) if card && index == focus => item.card_height(),
+            Entry::Item(item) => item.height(rows),
+        })
+        .collect::<Vec<u16>>();
+    let mut offset = state.offset().min(entries.len() - 1);
+    if focus < offset {
+        offset = focus;
+        if offset > 0 && matches!(entries[offset - 1], Entry::Heading(_)) {
+            offset -= 1;
+        }
+    }
+    let mut span = heights[offset..=focus.max(offset)].iter().sum::<u16>();
+    while offset < focus && span > area.height {
+        span -= heights[offset];
+        offset += 1;
+    }
+
+    // Backfill: when the tail of the list fits, show as much above it as fits
+    // too, rather than leaving empty rows after a resize.
+    let mut used = 0u16;
+    for height in &heights[offset..] {
+        used = used.saturating_add(*height);
+        if used > area.height {
+            break;
+        }
+    }
+    while offset > 0 && used.saturating_add(heights[offset - 1]) <= area.height {
+        offset -= 1;
+        used += heights[offset];
+    }
+    *state.offset_mut() = offset;
+    let mut position = items.partition_point(|item| *item < offset);
+    let mut y = area.y;
+    for (entry, h) in entries.iter().zip(&heights).skip(offset) {
+        let h = *h;
+        if y + h > area.bottom() {
+            break;
+        }
+        match entry {
+            Entry::Heading(text) => frame.render_widget(
+                Paragraph::new(heading(text, theme)),
+                Rect::new(area.x + 2, y, area.width.saturating_sub(2), 1),
+            ),
+            Entry::Item(item) => {
+                let rect = Rect::new(area.x, y, area.width, h);
+                let is_card = card && position == cursor;
+                if is_card {
+                    draw_card(frame, rect, item, theme);
+                } else {
+                    draw_item(frame, rect, item, focused && position == cursor, theme);
+                }
+                if pointer != Pointer::Inert {
+                    hits.push(HitRegion {
+                        area: rect,
+                        target: HitTarget::Row {
+                            index: position,
+                            checkbox: false,
+                        },
+                    });
+                    if pointer == Pointer::Select && item.marker.is_some() {
+                        hits.push(HitRegion {
+                            area: Rect::new(rect.x + 1, rect.y, 3.min(rect.width), h),
+                            target: HitTarget::Row {
+                                index: position,
+                                checkbox: true,
+                            },
+                        });
+                    }
+                }
+                if is_card && pointer != Pointer::Inert {
+                    card_hits(rect, hits, theme);
+                    // The card keeps the selection marker on its title row.
+                    if pointer == Pointer::Select && item.marker.is_some() {
+                        hits.push(HitRegion {
+                            area: Rect::new(rect.x + 1, rect.y + 1, 3.min(rect.width), 1),
+                            target: HitTarget::Row {
+                                index: position,
+                                checkbox: true,
+                            },
+                        });
+                    }
+                }
+                position += 1;
+            }
+        }
+        y += h;
+    }
+}
+
+/// The key-hint row of the launcher card and where each hint sits.
+fn card_hint_layout(rect: Rect, theme: Theme) -> (Line<'static>, Vec<(Rect, KeyEvent)>) {
+    let row = rect.y + rect.height.saturating_sub(2);
+    let mut x = rect.x + 4;
+    let mut spans = Vec::new();
+    let mut targets = Vec::new();
+    for (index, (key, label, event)) in card_hints().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("   ", theme.focus_soft));
+            x += 3;
+        }
+        let cap = format!(" {key} ");
+        let text = format!(" {label}");
+        let width = (Line::raw(&cap).width() + Line::raw(&text).width()) as u16;
+        if x + width > rect.right().saturating_sub(2) {
+            break;
+        }
+        spans.push(Span::styled(cap, theme.element));
+        spans.push(Span::styled(text, theme.focus_soft));
+        targets.push((Rect::new(x, row, width, 1), event));
+        x += width;
+    }
+    (Line::from(spans), targets)
+}
+
+fn card_hits(rect: Rect, hits: &mut Vec<HitRegion>, theme: Theme) {
+    for (area, event) in card_hint_layout(rect, theme).1 {
+        hits.push(HitRegion {
+            area,
+            target: HitTarget::Key(event),
+        });
+    }
+}
+
+/// The focused session in the launcher: a filled card with the name and age,
+/// its repositories, the description and the keys that act on it.
+fn draw_card(frame: &mut ratatui::Frame<'_>, area: Rect, item: &Item, theme: Theme) {
+    frame.render_widget(Block::default().style(theme.focus), area);
+    let width = area.width.saturating_sub(8) as usize;
+    let meta_width = Line::raw(&item.meta).width();
+    let title = Rect::new(area.x + 4, area.y + 1, area.width.saturating_sub(8), 1);
+    if let Some((glyph, _)) = item.marker {
+        frame.render_widget(
+            Paragraph::new(glyph).style(theme.focus),
+            Rect::new(area.x + 2, title.y, 1, 1),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(clip(&item.name, width.saturating_sub(meta_width + 2))).style(theme.focus),
+        title,
     );
+    if meta_width < width {
+        frame.render_widget(
+            Paragraph::new(item.meta.as_str()).style(theme.focus_soft),
+            Rect::new(
+                title.right() - meta_width as u16,
+                title.y,
+                meta_width as u16,
+                1,
+            ),
+        );
+    }
+    let mut y = area.y + 2;
+    frame.render_widget(
+        Paragraph::new(item.second_line(width)).style(theme.focus),
+        Rect::new(area.x + 4, y, width as u16, 1),
+    );
+    y += 1;
+    if !item.detail.is_empty() {
+        frame.render_widget(
+            Paragraph::new(clip(&item.detail, width))
+                .style(theme.focus_soft.add_modifier(Modifier::ITALIC)),
+            Rect::new(area.x + 4, y, width as u16, 1),
+        );
+    }
+    // The hint row starts where its click targets do, aligned with the title.
+    let (hints, _) = card_hint_layout(area, theme);
+    frame.render_widget(
+        Paragraph::new(hints),
+        Rect::new(
+            area.x + 4,
+            area.y + area.height.saturating_sub(2),
+            area.width.saturating_sub(4),
+            1,
+        ),
+    );
+}
+
+fn draw_item(frame: &mut ratatui::Frame<'_>, area: Rect, item: &Item, focused: bool, theme: Theme) {
+    if focused {
+        frame.render_widget(Block::default().style(theme.focus), area);
+    }
+    let (name, soft) = if focused {
+        (theme.focus, theme.focus_soft)
+    } else {
+        (theme.title, theme.muted)
+    };
+    let lead = if item.marker.is_some() { 4 } else { 2 };
+    let width = area.width as usize;
+    let meta_width = Line::raw(&item.meta).width();
+    let meta_width = if width >= lead + 16 + meta_width {
+        meta_width
+    } else {
+        0
+    };
+    let mut spans = vec![Span::raw("  ")];
+    if let Some((glyph, style)) = item.marker {
+        spans.push(Span::styled(
+            glyph,
+            if focused { theme.focus } else { style },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    let name_width = width.saturating_sub(lead + 2 + meta_width + usize::from(meta_width > 0) * 2);
+    let shown = clip(&item.name, name_width);
+    let gap = name_width.saturating_sub(Line::raw(&shown).width());
+    spans.push(Span::styled(shown, name));
+    if meta_width > 0 {
+        spans.push(Span::raw(" ".repeat(gap + 2)));
+        spans.push(Span::styled(item.meta.clone(), soft));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height >= 2 && !(item.sub.is_empty() && item.names.is_empty()) {
+        frame.render_widget(
+            Paragraph::new(item.second_line(width.saturating_sub(lead + 2))).style(soft),
+            Rect::new(
+                area.x + lead as u16,
+                area.y + 1,
+                area.width.saturating_sub(lead as u16),
+                1,
+            ),
+        );
+    }
+    if area.height >= 3 && !item.detail.is_empty() {
+        frame.render_widget(
+            Paragraph::new(clip(&item.detail, width.saturating_sub(lead + 2))).style(
+                if item.italic {
+                    soft.add_modifier(Modifier::ITALIC)
+                } else {
+                    soft
+                },
+            ),
+            Rect::new(
+                area.x + lead as u16,
+                area.y + 2,
+                area.width.saturating_sub(lead as u16),
+                1,
+            ),
+        );
+    }
 }
 
 #[derive(Default)]
@@ -3719,25 +5276,20 @@ impl Details {
         text
     }
 
-    /// Draws the raised sidebar and returns the clickable "f2 details" hint.
+    /// Draws the sidebar and returns the clickable "f2 details" hint.
     fn draw(&self, frame: &mut ratatui::Frame<'_>, area: Rect) -> Rect {
         let theme = Theme::new();
-        frame.render_widget(
-            Block::default().style(theme.base.patch(theme.surface)),
-            area,
-        );
-        if !theme.colors {
-            for y in area.top()..area.bottom() {
-                frame.render_widget(
-                    Paragraph::new("│").style(theme.border),
-                    Rect::new(area.x, y, 1, 1),
-                );
-            }
+        frame.render_widget(Block::default().style(theme.base.patch(theme.canvas)), area);
+        for y in area.top()..area.bottom() {
+            frame.render_widget(
+                Paragraph::new("│").style(theme.border),
+                Rect::new(area.x, y, 1, 1),
+            );
         }
         let inner = Rect::new(
-            area.x + 2.min(area.width),
+            area.x + 3.min(area.width),
             area.y + 1.min(area.height),
-            area.width.saturating_sub(4),
+            area.width.saturating_sub(5),
             area.height.saturating_sub(2),
         );
         if inner.height < 4 || inner.width == 0 {
@@ -3760,25 +5312,25 @@ impl Details {
                 break;
             }
             lines.push(Line::raw(""));
-            lines.push(Line::styled(*label, theme.title));
+            lines.push(Line::from(heading(label, theme)));
             for line in wrap_lines(value, width) {
                 if lines.len() >= field_limit {
                     break;
                 }
-                lines.push(Line::styled(line, theme.muted));
+                lines.push(Line::styled(line, theme.key));
             }
         }
         if !self.items.is_empty() && lines.len() + 2 < capacity {
             lines.push(Line::raw(""));
             if !self.items_title.is_empty() {
-                lines.push(Line::styled(
-                    if self.tree {
+                lines.push(Line::from(heading(
+                    &if self.tree {
                         self.items_title.to_string()
                     } else {
                         format!("{} ({})", self.items_title, self.items.len())
                     },
-                    theme.title,
-                ));
+                    theme,
+                )));
             }
             let room = capacity.saturating_sub(lines.len());
             let shown = if self.items.len() <= room {
@@ -3793,7 +5345,7 @@ impl Details {
                 } else {
                     clip_line(
                         Line::from(vec![
-                            Span::styled("• ", item_tone(summary, theme)),
+                            Span::styled(format!("{} ", item_marker(summary)), theme.key),
                             Span::styled(summary.to_owned(), theme.key),
                         ]),
                         width,
@@ -3814,14 +5366,17 @@ impl Details {
             Paragraph::new(lines),
             Rect::new(inner.x, inner.y, inner.width, capacity as u16),
         );
-        let hint = Rect::new(inner.x, inner.bottom() - 2, 10.min(inner.width), 1);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("f2", theme.key),
-                Span::styled(" details", theme.muted),
-            ])),
-            hint,
+        let hint_line = Line::from(vec![
+            keycap("f2", theme),
+            Span::styled(" details", theme.muted),
+        ]);
+        let hint = Rect::new(
+            inner.x,
+            inner.bottom() - 2,
+            (hint_line.width() as u16).min(inner.width),
+            1,
         );
+        frame.render_widget(Paragraph::new(hint_line), hint);
         frame.render_widget(
             Paragraph::new(brand_line(theme)),
             Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
@@ -3830,49 +5385,37 @@ impl Details {
     }
 }
 
-/// Bullet color for a repository summary: links green, worktrees purple,
-/// missing paths red.
-fn item_tone(summary: &str, theme: Theme) -> Style {
+/// The marker for a repository summary such as "api · link · main".
+fn item_marker(summary: &str) -> &'static str {
     let parts = summary.split(" · ").collect::<Vec<_>>();
     if parts.contains(&"missing") {
-        theme.error
+        MISSING
     } else if parts.iter().any(|part| part.starts_with("worktree")) {
-        theme.accent
-    } else if parts.contains(&"link") || parts.len() > 1 {
-        theme.success
+        WORKTREE
     } else {
-        theme.muted
+        SELECTED
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextStyle {
-    /// Help: "Key: description" lines become description-left, key-right rows.
+    /// Help: "Key: description" lines become description-left, keycap-right rows.
     Keybinds,
-    /// Details and confirmations: a bold first line, then "Label: value" lines.
+    /// Details and confirmations: "Label: value" lines with a muted label.
     Fields,
 }
 
+/// Turns dialog text into styled lines. "# Name" lines become uppercase
+/// headings in both styles.
 fn styled_text(text: &str, style: TextStyle, width: usize, theme: Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (index, source) in text.split('\n').enumerate() {
+    for source in text.split('\n') {
         if source.is_empty() {
             lines.push(Line::raw(""));
             continue;
         }
-        if let Some(heading) = source
-            .strip_prefix("# ")
-            .filter(|_| style == TextStyle::Keybinds)
-        {
-            lines.push(Line::styled(clip(heading, width), theme.accent));
-            continue;
-        }
-        if index == 0 && style == TextStyle::Fields {
-            lines.extend(
-                wrap_lines(source, width)
-                    .into_iter()
-                    .map(|line| Line::styled(line, theme.title)),
-            );
+        if let Some(name) = source.strip_prefix("# ") {
+            lines.push(Line::from(heading(&clip(name, width), theme)));
             continue;
         }
         let pair = source
@@ -3880,7 +5423,7 @@ fn styled_text(text: &str, style: TextStyle, width: usize, theme: Theme) -> Vec<
             .filter(|(key, _)| Line::raw(*key).width() <= 36 && !key.contains(". "));
         match (style, pair) {
             (TextStyle::Keybinds, Some((key, description))) => {
-                let key = key.to_lowercase();
+                let key = format!(" {} ", key.to_lowercase());
                 let key_width = Line::raw(&key).width();
                 let text_width = width.saturating_sub(key_width + 2).max(width / 2);
                 for (part_index, part) in
@@ -3891,7 +5434,7 @@ fn styled_text(text: &str, style: TextStyle, width: usize, theme: Theme) -> Vec<
                         lines.push(Line::from(vec![
                             Span::styled(part, theme.key),
                             Span::raw(" ".repeat(width - part_width - key_width)),
-                            Span::styled(key.clone(), theme.muted),
+                            Span::styled(key.clone(), theme.element),
                         ]));
                     } else {
                         lines.push(Line::styled(part, theme.key));
@@ -3938,8 +5481,6 @@ fn navigate(cursor: &mut usize, key: KeyCode, len: usize, page: u16) -> bool {
     true
 }
 
-const BROWSE_HINTS: &str = "Enter Open  Ctrl+N New  Ctrl+A Add  Ctrl+E Rename  Ctrl+D Delete  Right Repos  Ctrl+S Select  Ctrl+R Refresh";
-const FILTERED_BROWSE_HINTS: &str = "Enter Open  Esc Clear  Ctrl+N New  Ctrl+A Add  Ctrl+E Rename  Ctrl+D Delete  Right Repos  Ctrl+S Select  Ctrl+R Refresh";
 const PICKER_HELP: &str = "# Choose repositories
 Ctrl+P: Search commands
 Enter: Continue, choose a branch or create the session
@@ -3965,12 +5506,15 @@ Source repositories are never deleted.";
 const MANAGER_HELP: &str = "# Sessions
 Ctrl+P: Search commands
 Enter: Open the highlighted session
+Ctrl+O: Choose editor, T3 Code or Finder; Space remembers the choice
+Ctrl+T: Open in T3 Code (first use shows commands; y confirms)
 Ctrl+N: New session
 Ctrl+A: Add repositories to the highlighted session
 Ctrl+E: Rename the selected or highlighted session
 Ctrl+D: Delete the selected or highlighted sessions
 Ctrl+S: Toggle selection; it survives filtering
 Right: Show repositories; Left or Esc returns
+Tab: Switch between the launcher and all sessions
 Ctrl+R: Refresh after changes elsewhere
 
 # Navigation
@@ -3993,9 +5537,88 @@ Deleting a session keeps source repositories and managed worktrees.";
 mod tests {
     use super::*;
     use crate::git::GitRepoStatus;
+    use ratatui::style::Modifier;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn open_with_preserves_focus_and_config_when_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::initialize_at(temp.path().join(".dynws"), temp.path()).unwrap();
+        let mut app = SessionManagerApp::new(
+            vec![manager_session("one"), manager_session("two")],
+            SessionStore::new(paths.clone()),
+        );
+        app.cursor = 1;
+        app.selected.insert("one".into());
+        app.handle_key(key_event(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(app.open_dialog.as_ref().unwrap().session, "two");
+        for (width, height) in [(40, 12), (60, 16), (80, 24), (120, 40)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("T3 Code") && text.contains("Finder") && text.contains("Cancel"),
+                "{width}x{height}: {text}"
+            );
+            capture(&terminal, &format!("open-with-{width}"));
+        }
+        app.handle_key(key_event(KeyCode::Char('3'), KeyModifiers::NONE));
+        app.handle_key(key_event(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.open_dialog.as_ref().unwrap().remember);
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.open_dialog.is_none());
+        assert_eq!(app.cursor, 1);
+        assert!(app.selected.contains("one"));
+        assert!(!paths.config_file.exists());
+    }
+
+    #[test]
+    fn first_use_enter_cancels_without_running_or_saving() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::initialize_at(temp.path().join(".dynws"), temp.path()).unwrap();
+        let mut app = SessionManagerApp::new(
+            vec![manager_session("one")],
+            SessionStore::new(paths.clone()),
+        );
+        app.start_open_dialog(false);
+        let plan =
+            OpenPlan::new(Opener::Editor, &Config::default(), temp.path(), Some("sh")).unwrap();
+        app.open_dialog.as_mut().unwrap().confirmation = Some(plan);
+        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.open_dialog.as_ref().unwrap().confirmation.is_none());
+        assert!(app.opening.is_none());
+        assert!(!paths.config_file.exists());
+    }
+
+    #[test]
+    fn open_with_rejects_stale_preferences_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = DynwsPaths::initialize_at(temp.path().join(".dynws"), temp.path()).unwrap();
+        let mut app = SessionManagerApp::new(
+            vec![manager_session("one")],
+            SessionStore::new(paths.clone()),
+        );
+        app.start_open_dialog(false);
+        let mut dialog = app.open_dialog.take().unwrap();
+        dialog.remember = true;
+        let mut changed = Config::default();
+        changed.open.cd = true;
+        changed.save(&paths).unwrap();
+        let plan =
+            OpenPlan::new(Opener::Editor, &Config::default(), temp.path(), Some("sh")).unwrap();
+        app.execute_open(dialog, plan, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.opening.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_open();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.open_details.contains("Configuration changed elsewhere"));
+        assert_eq!(Config::load(&paths).unwrap(), changed);
+    }
 
     #[test]
     fn palette_search_preserves_session_state_and_dispatches_existing_actions() {
@@ -4206,7 +5829,7 @@ mod tests {
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
             terminal.draw(|frame| app.draw(frame)).unwrap();
             assert!(app.item_details().text().contains("first.rs"));
-            if w >= 100 {
+            if w >= 100 && h >= 40 {
                 assert!(buffer_text(&terminal).contains("first.rs"));
             }
             capture(&terminal, &format!("folder-tree-{w}x{h}"));
@@ -4504,20 +6127,33 @@ mod tests {
         manager.cursor = 119;
         manager.selected.insert("session-000".into());
         manager.message = "Error: changed elsewhere; Ctrl+R refreshes".into();
-        for width in [39, 40, 41, 59, 60, 61, 80, 99, 100, 101, 120] {
-            for height in [11, 12, 15, 16, 19, 20, 24, 40] {
+        for (launcher, width, height) in [false, true].into_iter().flat_map(|launcher| {
+            [39, 40, 41, 59, 60, 61, 80, 99, 100, 101, 120]
+                .into_iter()
+                .flat_map(move |width| {
+                    [11, 12, 15, 16, 19, 20, 24, 40]
+                        .into_iter()
+                        .map(move |height| (launcher, width, height))
+                })
+        }) {
+            {
+                manager.launcher = launcher;
                 let mut terminal =
                     Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
                 terminal.draw(|frame| manager.draw(frame)).unwrap();
                 let text = buffer_text(&terminal);
                 if width >= 40 && height >= 12 {
-                    assert!(text.contains("session-119"), "{width}x{height}");
-                    assert!(text.contains("1 selected"));
-                    assert!(text.contains("Error:"));
-                    assert!(text.contains("ctrl+p commands"));
+                    let at = format!("{width}x{height} launcher={launcher}\n{text}");
+                    assert!(text.contains("session-119"), "{at}");
+                    assert!(text.contains("1 selected"), "{at}");
+                    assert!(text.contains("Error:"), "{at}");
+                    assert!(text.contains("Commands") && text.contains("ctrl+p"), "{at}");
+                    let home = launcher && width >= 60 && height >= 20;
+                    assert_eq!(text.contains("Open a session"), home, "{at}");
                     assert_eq!(
                         text.contains(&format!("dynws {VERSION}")),
-                        width >= 100 && height >= 20
+                        !home && width >= 100 && height >= 20,
+                        "{at}"
                     );
                 }
                 assert_eq!(manager.cursor, 119);
@@ -4538,6 +6174,7 @@ mod tests {
             RepoLink::link("second", "/目录/é/🧑‍💻/second"),
         ];
         let mut manager = SessionManagerApp::new(vec![alpha, manager_session("beta")], store);
+        manager.launcher = false;
         manager.selected.insert("beta".into());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| manager.draw(frame)).unwrap();
@@ -4653,6 +6290,7 @@ mod tests {
             .unwrap();
         store.create_session("two", &[repo], None, true).unwrap();
         let mut manager = SessionManagerApp::new(store.load_sessions().unwrap(), store.clone());
+        manager.set_cursor_to_name("one");
         for _ in 0..2 {
             manager.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         }
@@ -4735,7 +6373,7 @@ mod tests {
         manager.start_remove();
         terminal.draw(|frame| manager.draw(frame)).unwrap();
         capture(&terminal, "polish-confirm");
-        assert!(buffer_text(&terminal).contains("Delete session"));
+        assert!(buffer_text(&terminal).contains("Delete incident-482?"));
         assert!(!buffer_text(&terminal).contains("api review across"));
         manager.mode = SessionManagerMode::Browse;
         manager.message = "Error: session changed elsewhere; Ctrl+R refreshes".into();
@@ -4873,7 +6511,7 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
         terminal.draw(|frame| manager.draw(frame)).unwrap();
         capture(&terminal, "empty-60x16");
-        assert!(buffer_text(&terminal).contains("to create your first session"));
+        assert!(buffer_text(&terminal).contains("Create your first session"));
         manager.message = format!("Error: {} THE_END", "long path /目录/ ".repeat(100));
         manager.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
         for _ in 0..200 {
@@ -4957,13 +6595,13 @@ mod tests {
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| picker.draw(frame)).unwrap();
             assert!(buffer_text(&terminal).contains("repo-099"));
-            assert!(buffer_text(&terminal).contains("100 / 100 · 0 selected · 0 hidden"));
+            assert!(buffer_text(&terminal).contains("0 selected · 100 of 100"));
             assert!(picker.view.list.offset() > 0);
             terminal.draw(|frame| manager.draw(frame)).unwrap();
             let text = buffer_text(&terminal);
             capture(&terminal, &format!("manager-{width}x{height}"));
             assert!(text.contains("session-099"));
-            assert!(text.contains("ctrl+p commands"));
+            assert!(text.contains("Commands"));
             if let Ok(dir) = std::env::var("DWS_CAPTURE_DIR") {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(format!("{dir}/manager-{width}x{height}.txt"), &text).unwrap();
@@ -4997,13 +6635,13 @@ mod tests {
         terminal.draw(|frame| picker.draw(frame)).unwrap();
         capture(&terminal, "branch-60x16");
         assert!(buffer_text(&terminal).contains("branch-099"));
-        assert!(buffer_text(&terminal).contains("100 / 100 branches"));
+        assert!(buffer_text(&terminal).contains("100 of 100 branches"));
         if let Mode::Branch(branches) = &mut picker.mode {
             branches.filter = "missing".into();
         }
         picker.cursor = 0;
         terminal.draw(|frame| picker.draw(frame)).unwrap();
-        assert!(buffer_text(&terminal).contains("0 / 100 branches"));
+        assert!(buffer_text(&terminal).contains("0 of 100 branches"));
         manager.sessions[99].repos = (0..100)
             .map(|i| RepoLink::link(format!("linked-{i:03}"), format!("/repo-{i:03}")))
             .collect();
@@ -5110,6 +6748,191 @@ mod tests {
             picker.branch_fetch.as_ref().unwrap().task.phase,
             GitTaskPhase::FetchPrune
         ));
+    }
+
+    fn row_hit_heights(view: &View) -> Vec<(usize, u16)> {
+        view.hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                HitTarget::Row {
+                    index,
+                    checkbox: false,
+                } => Some((index, hit.area.height)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_hits_on_screen(view: &View, width: u16, height: u16, what: &str) {
+        assert!(!view.hits.is_empty(), "{what}: no hit regions");
+        for hit in &view.hits {
+            assert!(
+                hit.area.right() <= width && hit.area.bottom() <= height,
+                "{what}: hit {:?} outside {width}x{height}",
+                hit.area
+            );
+        }
+    }
+
+    /// The width of the first rounded box drawn, such as the search field.
+    fn first_box_width(terminal: &Terminal<ratatui::backend::TestBackend>) -> usize {
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let row = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<Vec<_>>();
+            if let Some(start) = row.iter().position(|symbol| symbol == "╭") {
+                let end = row.iter().rposition(|symbol| symbol == "╮").unwrap();
+                return end - start + 1;
+            }
+        }
+        panic!("no box drawn");
+    }
+
+    /// The width of the details sidebar: the columns right of the full-height rule.
+    fn sidebar_width(terminal: &Terminal<ratatui::backend::TestBackend>) -> u16 {
+        let buffer = terminal.backend().buffer();
+        let (width, height) = (buffer.area.width, buffer.area.height);
+        let column = (0..width)
+            .find(|x| (0..height).all(|y| buffer[(*x, y)].symbol() == "│"))
+            .expect("sidebar rule");
+        width - column
+    }
+
+    #[test]
+    fn session_rows_fit_whole_names_and_group_by_recency() {
+        let names = [
+            "otelcol-contrib",
+            "reporting-service",
+            "workload-event-connector",
+        ]
+        .map(String::from);
+        assert_eq!(
+            fit_names(&names, 80),
+            "otelcol-contrib  reporting-service  workload-event-connector"
+        );
+        assert_eq!(
+            fit_names(&names, 40),
+            "otelcol-contrib  reporting-service  +1"
+        );
+        assert_eq!(fit_names(&names, 20), "otelcol-contrib  +2");
+        assert_eq!(fit_names(&names, 3), "+3");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-17T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(recency_group("2026-11-17T08:00:00Z", now), "Today");
+        assert_eq!(recency_group("2026-11-11T12:00:00Z", now), "This week");
+        assert_eq!(recency_group("2026-10-30T12:00:00Z", now), "This month");
+        assert_eq!(recency_group("2026-07-01T12:00:00Z", now), "Earlier");
+        assert_eq!(recency_group("not a time", now), "Earlier");
+    }
+
+    #[test]
+    fn large_terminals_scale_up_and_keep_targets_on_screen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(DynwsPaths::from_home(temp.path().join(".dynws")));
+        let sessions = (0..80)
+            .map(|i| {
+                let mut session = manager_session(&format!("session-{i:03}"));
+                session.description = Some(format!("description {i}"));
+                session
+            })
+            .collect::<Vec<_>>();
+        let repos = (0..60)
+            .map(|i| RepoCandidate {
+                name: format!("repo-{i:03}"),
+                path: temp.path().join(format!("repo-{i:03}")),
+                git: None,
+            })
+            .collect::<Vec<_>>();
+        for (width, height) in [(200, 55), (240, 65)] {
+            let what = format!("{width}x{height}");
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut manager = SessionManagerApp::new(sessions.clone(), store.clone());
+            manager.cursor = 79;
+
+            // Launcher.
+            terminal.draw(|frame| manager.draw(frame)).unwrap();
+            assert!(manager.launcher_visible(), "{what}");
+            capture(&terminal, &format!("large-launcher-{what}"));
+            assert!(first_box_width(&terminal) > 76, "{what} launcher box");
+            assert_hits_on_screen(&manager.view, width, height, &format!("{what} launcher"));
+            let rows = row_hit_heights(&manager.view);
+            assert!(rows.iter().any(|(index, _)| *index == 79), "{what} focus");
+            // The focused session is a card; the others are three-row items.
+            assert!(
+                rows.iter()
+                    .all(|(index, rows)| *rows == if *index == 79 { 6 } else { 3 }),
+                "{what} rows {rows:?}"
+            );
+            assert!(
+                manager.view.hits.iter().any(|hit| matches!(
+                    hit.target,
+                    HitTarget::Key(key) if key.code == KeyCode::Enter
+                ) && hit.area.y > 20),
+                "{what} card enter hint"
+            );
+
+            // List view with the sidebar.
+            manager.launcher = false;
+            terminal.draw(|frame| manager.draw(frame)).unwrap();
+            assert!(sidebar_width(&terminal) > 40, "{what} sidebar");
+            capture(&terminal, &format!("large-list-{what}"));
+            assert_hits_on_screen(&manager.view, width, height, &format!("{what} list"));
+            let rows = row_hit_heights(&manager.view);
+            assert!(rows.iter().any(|(index, _)| *index == 79), "{what} focus");
+            assert!(rows.iter().all(|(_, rows)| *rows == 3), "{what} rows");
+
+            // Palette over the list.
+            manager.view.palette = Some(Palette::default());
+            terminal.draw(|frame| manager.draw(frame)).unwrap();
+            assert_hits_on_screen(&manager.view, width, height, &format!("{what} palette"));
+            assert!(
+                manager
+                    .view
+                    .hits
+                    .iter()
+                    .any(|hit| matches!(hit.target, HitTarget::Command(_))),
+                "{what} palette commands"
+            );
+
+            // Creation dialog.
+            let mut picker = App::new(repos.clone(), store.clone());
+            picker.cursor = 59;
+            terminal.draw(|frame| picker.draw(frame)).unwrap();
+            assert_hits_on_screen(&picker.view, width, height, &format!("{what} creation"));
+            capture(&terminal, &format!("large-creation-{what}"));
+            let rows = row_hit_heights(&picker.view);
+            assert!(rows.iter().any(|(index, _)| *index == 59), "{what} focus");
+            assert!(rows.iter().all(|(_, rows)| *rows == 3), "{what} rows");
+            let dialog = buffer_text(&terminal);
+            assert!(dialog.contains("repo-059") && dialog.contains("WILL CREATE"));
+        }
+
+        // Regular sizes keep today's measurements.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let mut manager = SessionManagerApp::new(sessions.clone(), store.clone());
+        terminal.draw(|frame| manager.draw(frame)).unwrap();
+        assert_eq!(first_box_width(&terminal), 76);
+        assert!(
+            row_hit_heights(&manager.view)
+                .iter()
+                .all(|(index, rows)| *rows == if *index == manager.cursor { 6 } else { 2 })
+        );
+        manager.launcher = false;
+        terminal.draw(|frame| manager.draw(frame)).unwrap();
+        assert_eq!(sidebar_width(&terminal), 40);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|frame| manager.draw(frame)).unwrap();
+        assert!(
+            row_hit_heights(&manager.view)
+                .iter()
+                .all(|(_, rows)| *rows == 2)
+        );
+        manager.launcher = true;
+        terminal.draw(|frame| manager.draw(frame)).unwrap();
+        assert_eq!(first_box_width(&terminal), 56);
     }
 
     fn manager_session(name: &str) -> SessionMetadata {

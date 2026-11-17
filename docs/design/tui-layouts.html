@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dws Interface Preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: sticky section nav, then Views, Flows and T3 Code; every mock is a terminal drawn on a character grid. */
+:root {
+  color-scheme: dark;
+  --void: #09090b;
+  --canvas: #0e0e10;
+  --graphite: #151517;
+  --alloy: #1d1d20;
+  --hairline: #303034;
+  --chalk: #f2f2f3;
+  --ash: #96969c;
+  --emphasis: #e8e8ea;
+  --font-ui: "Geist", "SF Pro Text", Inter, system-ui, sans-serif;
+  --font-mono: "Geist Mono", SFMono-Regular, ui-monospace, Menlo, monospace;
+  --radius: 9px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--void);
+  color: var(--chalk);
+  font: 14px/1.5 var(--font-ui);
+  padding-block: 0 96px;
+}
+.wrap {
+  max-width: 1180px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--void); }
+nav.top {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5;
+  background: color-mix(in srgb, var(--void) 94%, transparent);
+  border-bottom: 1px solid var(--hairline);
+}
+nav.top .wrap { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; padding-block: 12px; }
+.crumb { font: 500 13px/1 var(--font-mono); color: var(--ash); }
+.crumb b { color: var(--chalk); font-weight: 600; }
+.links { display: flex; flex-wrap: wrap; gap: 4px; }
+.links a { color: var(--ash); text-decoration: none; font-weight: 500; padding: 8px 12px; border-radius: 7px; border: 1px solid transparent; }
+.links a:hover { color: var(--chalk); background: var(--graphite); }
+.links a:focus-visible, .switch input:focus-visible + span { outline: 2px solid var(--emphasis); outline-offset: 2px; }
+.switch { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; font-weight: 500; color: var(--chalk); padding: 6px 10px; border: 1px solid var(--hairline); border-radius: 7px; }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch span { width: 32px; height: 18px; border-radius: 999px; background: var(--alloy); border: 1px solid var(--hairline); position: relative; flex: none; }
+.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: var(--ash); }
+.switch input:checked + span { background: var(--emphasis); border-color: var(--emphasis); }
+.switch input:checked + span::after { left: 16px; background: var(--void); }
+@media (prefers-reduced-motion: no-preference) { .switch span::after { transition: left 140ms ease; } }
+
+header.intro { padding-block: 56px 24px; display: grid; gap: 12px; max-width: 70ch; }
+.eyebrow { font: 600 12px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ash); }
+h1 { margin: 0; font-size: 30px; line-height: 1.15; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { margin: 0; font-size: 22px; line-height: 1.2; font-weight: 600; text-wrap: balance; }
+h3 { margin: 0; font-size: 16px; line-height: 1.3; font-weight: 600; }
+p { margin: 0; }
+.soft { color: var(--ash); }
+code { font-family: var(--font-mono); font-size: 0.92em; color: var(--chalk); background: var(--graphite); border: 1px solid var(--hairline); border-radius: 5px; padding: 1px 5px; }
+
+section.block { display: grid; gap: 28px; padding-block: 40px; border-top: 1px solid var(--hairline); scroll-margin-top: 64px; }
+.block-head { display: grid; gap: 8px; max-width: 72ch; }
+.views { display: grid; gap: 40px; }
+.view { display: grid; gap: 12px; min-width: 0; }
+.view-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 6px 16px; }
+.view-head p { max-width: 72ch; }
+
+.frame { border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--void); overflow: hidden; min-width: 0; }
+.frame-bar { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--hairline); font: 12px/1 var(--font-mono); color: var(--ash); background: var(--canvas); }
+.scroll { overflow-x: auto; padding-block: 10px; }
+.screen {
+  --cols: 100;
+  position: relative;
+  font-family: var(--font-mono);
+  font-size: clamp(7px, calc((min(100vw, 1180px) - 64px) / (var(--cols) * 0.6)), 14px);
+  width: max-content;
+  margin: 0 auto;
+}
+.r { display: flex; height: 1.32em; line-height: 1.32em; white-space: pre; }
+.r span { display: block; height: 100%; }
+.r .g { width: 1ch; position: relative; }
+.b { font-weight: 600; }
+.bx::before { content: ""; position: absolute; border: 0 solid var(--c); }
+.v::before { left: 50%; top: 0; bottom: 0; border-left-width: 1px; }
+.h::before { top: 50%; left: 0; right: 0; border-top-width: 1px; }
+.tl::before { left: 50%; top: 50%; right: 0; bottom: 0; border-left-width: 1px; border-top-width: 1px; border-top-left-radius: 0.5em; }
+.tr::before { right: 50%; top: 50%; left: 0; bottom: 0; border-right-width: 1px; border-top-width: 1px; border-top-right-radius: 0.5em; }
+.bl::before { left: 50%; bottom: 50%; right: 0; top: 0; border-left-width: 1px; border-bottom-width: 1px; border-bottom-left-radius: 0.5em; }
+.br::before { right: 50%; bottom: 50%; left: 0; top: 0; border-right-width: 1px; border-bottom-width: 1px; border-bottom-right-radius: 0.5em; }
+.bx::after { content: ""; position: absolute; border: 0 solid var(--c); }
+.x::before, .jl::before, .jr::before { left: 50%; top: 0; bottom: 0; border-left-width: 1px; }
+.x::after { top: 50%; left: 0; right: 0; border-top-width: 1px; }
+.jl::after { top: 50%; left: 0; right: 50%; border-top-width: 1px; }
+.jr::after { top: 50%; left: 50%; right: 0; border-top-width: 1px; }
+.seg { display: inline-flex; padding: 3px; gap: 3px; border: 1px solid var(--hairline); border-radius: 9px; background: var(--canvas); width: max-content; max-width: 100%; flex-wrap: wrap; }
+.seg label { cursor: pointer; }
+.seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.seg span { display: inline-block; padding: 8px 14px; border-radius: 7px; color: var(--ash); font-weight: 500; border: 1px solid transparent; }
+.seg input:checked + span { background: var(--alloy); color: var(--chalk); border-color: var(--hairline); }
+.seg input:focus-visible + span { outline: 2px solid var(--emphasis); outline-offset: 1px; }
+.sig-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+.hits { position: absolute; inset: 0; pointer-events: none; display: none; }
+body.show-hits .hits { display: block; }
+.hit { position: absolute; outline: 1px dashed rgba(242, 242, 243, 0.8); outline-offset: -1px; background: rgba(242, 242, 243, 0.1); border-radius: 3px; }
+
+.flow { display: grid; gap: 28px; }
+.flow + .flow { border-top: 1px dashed var(--hairline); padding-top: 32px; }
+.steps { display: grid; gap: 28px; counter-reset: step; list-style: none; margin: 0; padding: 0; }
+.step { display: grid; gap: 10px; min-width: 0; }
+.step-label { display: flex; align-items: baseline; gap: 10px; }
+.step-label .n { font: 600 12px/1 var(--font-mono); color: var(--void); background: var(--emphasis); border-radius: 999px; min-width: 22px; height: 22px; display: inline-grid; place-items: center; padding-inline: 6px; flex: none; }
+.step-label .key { font: 500 12px/1 var(--font-mono); color: var(--ash); }
+
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.card { border: 1px solid var(--hairline); border-radius: var(--radius); background: var(--canvas); padding: 18px 20px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.card ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.card pre { margin: 0; overflow-x: auto; font: 12.5px/1.6 var(--font-mono); background: var(--void); border: 1px solid var(--hairline); border-radius: 7px; padding: 12px 14px; color: var(--chalk); }
+.badge { display: inline-flex; align-items: center; gap: 6px; font: 600 11px/1 var(--font-mono); letter-spacing: 0.04em; text-transform: uppercase; padding: 5px 8px; border-radius: 999px; border: 1px solid var(--hairline); color: var(--ash); width: max-content; }
+.badge.solid { color: var(--void); background: var(--emphasis); border-color: var(--emphasis); }
+</style>
+</head>
+<body>
+<nav class="top" aria-label="Sections">
+  <div class="wrap">
+    <span class="crumb">dynws / design / <b>interface preview</b></span>
+    <div class="links"><a href="#signature">Signature</a><a href="#views">Views</a><a href="#flows">Flows</a><a href="#t3">T3 Code</a></div>
+    <label class="switch"><input type="checkbox" id="show-hits"><span aria-hidden="true"></span>Show click targets</label>
+  </div>
+</nav>
+
+<div class="wrap">
+  <header class="intro">
+    <div class="eyebrow">Launcher home · guided creation · slate</div>
+    <h1>dws interface preview</h1>
+    <p class="soft">The layouts you picked (A launcher home, C guided creation dialog), now in the slate house style: monochrome surfaces, hairline borders and reverse contrast for focus. State is carried by shape and label, not color. Click targets are larger: list items take two rows, and the main actions are three-row buttons. Turn on <b>Show click targets</b> to see every one.</p>
+  </header>
+
+  <section class="block" id="signature">
+    <div class="block-head">
+      <div class="eyebrow">Home signature</div>
+      <h2>Constellation</h2>
+      <p class="soft">Repositories in <code>~/code</code> are stars. Each session draws itself as a constellation joining its repositories, labelled with the session name, then the next session takes over. In the app it shows your real sessions, animates only while the launcher is idle, and holds one frame under reduced motion or <code>NO_COLOR</code>.</p>
+    </div>
+    <div id="sig-preview"></div>
+  </section>
+
+  <section class="block" id="views">
+    <div class="block-head">
+      <div class="eyebrow">Views</div>
+      <h2>Every screen</h2>
+      <p class="soft">Mocks use realistic sessions from a <code>~/code</code> collection. Terminal sizes are noted on each frame.</p>
+    </div>
+    <div class="views" id="view-list"></div>
+  </section>
+
+  <section class="block" id="flows">
+    <div class="block-head">
+      <div class="eyebrow">Flows</div>
+      <h2>Opening and creating a session</h2>
+      <p class="soft">Each step names the key or click that moves to the next one.</p>
+    </div>
+    <div id="flow-list" class="views"></div>
+  </section>
+
+  <section class="block" id="t3">
+    <div class="block-head">
+      <div class="eyebrow">Integration</div>
+      <h2>Open a session in T3 Code</h2>
+      <p class="soft">Verified against T3 Code (Beta) 0.1.7 on 2026-11-17. dws uses the bundled CLI to open the workspace; the desktop app adds a missing project.</p>
+    </div>
+    <div class="cols">
+      <div class="card">
+        <span class="badge solid">Found</span>
+        <h3>What T3 Code exposes</h3>
+        <ul>
+          <li>A bundled CLI at <code>~/.t3/bin/t3</code>.</li>
+          <li><code>t3 project add &lt;path&gt; --title &lt;name&gt;</code> adds a project for a workspace root.</li>
+          <li><code>t3 app [&lt;path&gt;]</code> opens a project in the running desktop app.</li>
+          <li>The <code>t3code://</code> URL scheme only handles pairing and opening the app, so the CLI is the supported route. dws should never write T3's database directly; it is event-sourced.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="badge">Implemented</span>
+        <h3>How dws uses it</h3>
+        <ul>
+          <li>A new opener, <b>T3 Code</b>, beside your editor: in the Open with dialog, the palette, and after creating a session.</li>
+          <li>The first time, a dialog shows the exact commands. dws then runs them and remembers the choice if you tick it.</li>
+          <li>Default for every session: <code>dws config set opener t3</code>.</li>
+          <li>Failures stay visible: a missing CLI or an error from <code>t3</code> shows an inline alert, with the output in <code>f2</code> details.</li>
+        </ul>
+<pre>~/.t3/bin/t3 app ~/code/.dynws/workspaces/api-review</pre>
+      </div>
+      <div class="card">
+        <span class="badge">Live verification</span>
+        <h3>Verified and remaining</h3>
+        <ul>
+          <li><code>t3 project add</code> rejects an existing project with <code>ProjectAlreadyExistsError</code>; it is not an idempotent opener.</li>
+          <li><code>t3 app</code> successfully added a fresh scratch project and opened it twice. The built dws opener also succeeded with a workspace path containing spaces.</li>
+          <li>Opening the separately preregistered scratch project returned <code>project-create-failed</code>; its cause is unresolved. Behavior with the desktop app closed remains unverified.</li>
+        </ul>
+        <p class="soft">Scratch registration and opening were explicitly approved. dws does not modify T3's database directly.</p>
+        <p class="soft">Works today without code: <code>dws config set editor "$HOME/.t3/bin/t3 app"</code>. dws passes the workspace path as the last argument.</p>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const S = {
+  void: "#09090b", canvas: "#0e0e10", graphite: "#151517", alloy: "#1d1d20",
+  hair: "#303034", chalk: "#f2f2f3", ash: "#96969c", em: "#e8e8ea",
+  dim: "#6e6e75", inkSoft: "#4a4a50",
+};
+const BOX = { "│": "v", "─": "h", "╭": "tl", "╮": "tr", "╰": "bl", "╯": "br", "┼": "x", "┤": "jl", "├": "jr" };
+const HALF = new Set(["▀", "▄", "█"]);
+
+class Term {
+  constructor(w, h) {
+    this.w = w; this.h = h; this.hits = [];
+    this.c = Array.from({ length: h }, () => Array.from({ length: w }, () => ({ ch: " ", fg: S.chalk, bg: S.void, b: false })));
+  }
+  cell(x, y) { return x >= 0 && y >= 0 && x < this.w && y < this.h ? this.c[y][x] : null; }
+  fill(x, y, w, h, bg) {
+    for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) {
+      const k = this.cell(i, j); if (k) { k.ch = " "; k.bg = bg; k.b = false; }
+    }
+  }
+  put(x, y, s, o = {}) {
+    let i = x;
+    for (const ch of s) {
+      const k = this.cell(i, y);
+      if (k) { k.ch = ch; if (o.fg) k.fg = o.fg; if (o.bg) k.bg = o.bg; k.b = !!o.b; }
+      i++;
+    }
+    return i;
+  }
+  line(x, y, parts) { let i = x; for (const [s, o] of parts) i = this.put(i, y, s, o || {}); return i; }
+  right(end, y, s, o) { return this.put(end - len(s), y, s, o); }
+  hit(x, y, w, h) { this.hits.push({ x, y, w, h }); }
+  dim(keep) {
+    for (let y = 0; y < this.h; y++) for (let x = 0; x < this.w; x++) {
+      if (x >= keep.x && x < keep.x + keep.w && y >= keep.y && y < keep.y + keep.h) continue;
+      const k = this.c[y][x]; k.fg = darken(k.fg); k.bg = darken(k.bg);
+    }
+    this.hits = this.hits.filter(r => r.modal);
+  }
+  html() {
+    let out = "";
+    for (const row of this.c) {
+      out += '<div class="r">';
+      let run = null;
+      const flush = () => {
+        if (!run) return;
+        out += `<span class="${run.b ? "b" : ""}" style="color:${run.fg};background:${run.bg}">${esc(run.s)}</span>`;
+        run = null;
+      };
+      for (const k of row) {
+        if (BOX[k.ch]) { flush(); out += `<span class="g bx ${BOX[k.ch]}" style="--c:${k.fg};background:${k.bg}"></span>`; continue; }
+        if (HALF.has(k.ch)) { flush(); out += `<span class="g" style="background:${half(k)}"></span>`; continue; }
+        if (run && run.fg === k.fg && run.bg === k.bg && run.b === k.b) run.s += k.ch;
+        else { flush(); run = { s: k.ch, fg: k.fg, bg: k.bg, b: k.b }; }
+      }
+      flush();
+      out += "</div>";
+    }
+    out += '<div class="hits" aria-hidden="true">' + this.hits.map(r =>
+      `<div class="hit" style="left:${r.x}ch;top:${(r.y * 1.32).toFixed(2)}em;width:${r.w}ch;height:${(r.h * 1.32).toFixed(2)}em"></div>`).join("") + "</div>";
+    return out;
+  }
+}
+const len = s => [...s].length;
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function darken(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return "#" + [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(v => Math.floor(v * 0.42).toString(16).padStart(2, "0")).join("");
+}
+function half({ ch, fg, bg }) {
+  if (ch === "█") return fg;
+  return ch === "▀" ? `linear-gradient(${fg} 50%, ${bg} 50%)` : `linear-gradient(${bg} 50%, ${fg} 50%)`;
+}
+
+/* ---------- components ---------- */
+function box(t, x, y, w, h, border = S.hair, fill = null) {
+  if (fill) t.fill(x + 1, y + 1, w - 2, h - 2, fill);
+  t.put(x, y, "╭", { fg: border }); t.put(x + w - 1, y, "╮", { fg: border });
+  t.put(x, y + h - 1, "╰", { fg: border }); t.put(x + w - 1, y + h - 1, "╯", { fg: border });
+  for (let i = x + 1; i < x + w - 1; i++) { t.put(i, y, "─", { fg: border }); t.put(i, y + h - 1, "─", { fg: border }); }
+  for (let j = y + 1; j < y + h - 1; j++) { t.put(x, j, "│", { fg: border }); t.put(x + w - 1, j, "│", { fg: border }); }
+}
+const LOGO = [
+  ["   ▄          ", "          "],
+  ["█▀▀█ █  █ █▀▀▄", "█ █ █ █▀▀▀"],
+  ["█__█ █__█ █__█", "█_█_█ ^^^█"],
+  ["▀▀▀▀ ▀▀▀█ ▀~~▀", "▀▀▀▀▀ ▀▀▀▀"],
+];
+function logo(t, x, y) {
+  LOGO.forEach(([a, b], row) => {
+    let i = x;
+    const halfRow = (s, fg, shadow) => {
+      for (const ch of s) {
+        if (ch === "_") t.put(i, y + row, " ", { bg: shadow });
+        else if (ch === "^") t.put(i, y + row, "▀", { fg, bg: shadow });
+        else if (ch === "~") t.put(i, y + row, "▀", { fg: shadow });
+        else t.put(i, y + row, ch, { fg });
+        i++;
+      }
+    };
+    halfRow(a, S.dim, S.alloy); i++; halfRow(b, S.chalk, S.hair);
+  });
+}
+/* ---------- animated home signature: constellation ---------- */
+let FRAME = 0;
+const STILL = matchMedia("(prefers-reduced-motion: reduce)");
+const STARS = { api: [8, 1], worker: [20, 5], billing: [31, 0], web: [12, 6], infra: [37, 4], search: [26, 2], docs: [4, 4] };
+const SKY = [
+  ["api-review", ["api", "worker"]],
+  ["incident-482", ["api", "search", "billing"]],
+  ["release-check", ["docs", "web", "worker", "infra"]],
+];
+const hash = (a, b) => { let h = (a * 374761393 + b * 668265263) | 0; h = (h ^ (h >>> 13)) * 1274126177; return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+function constellation(t, ox, oy) {
+  const f = STILL.matches ? 40 : FRAME;
+  for (let i = 0; i < 20; i++) {
+    const x = ox + Math.floor(hash(i, 1) * 44) + 1, y = oy + Math.floor(hash(i, 2) * 7);
+    const tw = Math.sin(f * 0.15 + i * 1.7);
+    const c = t.cell(x, y);
+    if (c && c.ch === " ") { c.ch = tw > 0.6 ? "+" : "·"; c.fg = tw > 0.2 ? S.ash : S.inkSoft; }
+  }
+  const [name, members] = SKY[Math.floor(f / 64) % SKY.length];
+  const k = Math.min(1, (f % 64) / 26);
+  members.slice(1).forEach((m, i) => {
+    const [ax, ay] = STARS[members[i]], [bx, by] = STARS[m];
+    const progress = Math.max(0, Math.min(1, k * members.length - i));
+    const n = Math.max(Math.abs(bx - ax), Math.abs(by - ay) * 2, 1);
+    for (let s = 1; s < n * progress; s++) {
+      const c = t.cell(ox + Math.round(ax + (bx - ax) * s / n), oy + Math.round(ay + (by - ay) * s / n));
+      if (c) { c.ch = "·"; c.fg = S.ash; }
+    }
+  });
+  for (const [repo, [x, y]] of Object.entries(STARS)) {
+    const on = members.includes(repo);
+    t.put(ox + x, oy + y, on ? "●" : "○", { fg: on ? S.chalk : S.inkSoft });
+    t.put(ox + x + 2, oy + y, repo, { fg: on ? S.chalk : S.dim, b: on });
+  }
+  t.put(ox + 48, oy + 3, "dws", { fg: S.chalk, b: true });
+  t.put(ox + 48, oy + 4, name, { fg: S.ash });
+  return 7;
+}
+
+function field(t, x, y, w, o) {
+  t.put(x, y, o.label, { fg: S.chalk, b: true });
+  if (o.aside) t.right(x + w, y, o.aside, { fg: S.ash });
+  const focused = o.focused !== false;
+  box(t, x, y + 1, w, 3, focused ? S.em : S.hair);
+  const iy = y + 2;
+  let cx = x + 2;
+  if (o.icon) { t.put(cx, iy, o.icon, { fg: S.ash }); cx += 2; }
+  if (o.value) cx = t.put(cx, iy, o.value, { fg: S.chalk });
+  if (focused) t.put(cx, iy, " ", { bg: S.chalk });
+  if (!o.value && o.placeholder) t.put(cx + 1, iy, o.placeholder, { fg: S.ash });
+  if (o.trail) t.right(x + w - 2, iy, o.trail, { fg: S.ash });
+  if (o.help) t.put(x, y + 4, o.help, { fg: S.ash });
+}
+function buttonWidth(o) {
+  return 4 + (o.icon ? len(o.icon) + 1 : 0) + len(o.label) + (o.key ? 2 + len(o.key) : 0);
+}
+function button(t, x, y, o) {
+  const w = buttonWidth(o);
+  const strong = !!o.strong;
+  box(t, x, y, w, 3, strong ? S.em : S.hair, strong ? S.alloy : null);
+  const bg = strong ? S.alloy : undefined;
+  let cx = x + 2;
+  if (o.icon) cx = t.put(cx, y + 1, o.icon + " ", { fg: S.chalk, bg });
+  cx = t.put(cx, y + 1, o.label, { fg: S.chalk, bg, b: strong || o.bold });
+  if (o.key) { cx = t.put(cx, y + 1, "  ", { bg }); t.put(cx, y + 1, o.key, { fg: S.ash, bg }); }
+  t.hit(x, y, w, 3);
+  if (o.modal) t.hits[t.hits.length - 1].modal = true;
+  return w;
+}
+function buttons(t, x, y, items, align = "left", width = 0) {
+  const total = items.reduce((n, o) => n + buttonWidth(o), 0) + 2 * (items.length - 1);
+  let cx = align === "right" ? x + width - total : x;
+  for (const o of items) cx += button(t, cx, y, o) + 2;
+}
+function keycap(t, x, y, key, bg = S.alloy) { return t.put(x, y, ` ${key} `, { fg: S.chalk, bg }); }
+function keyhints(t, x, y, w, items, location) {
+  const width = items.reduce((n, [k, l]) => n + len(k) + 2 + 1 + len(l), 0) + 3 * (items.length - 1);
+  let cx = x + w - width;
+  if (location) t.put(x, y, location, { fg: S.ash });
+  for (const [k, l] of items) {
+    const start = cx;
+    cx = keycap(t, cx, y, k);
+    cx = t.put(cx, y, " " + l, { fg: S.ash });
+    t.hit(start, y, cx - start, 1);
+    cx += 3;
+  }
+}
+function heading(t, x, y, s, aside, w) {
+  t.put(x, y, s.toUpperCase(), { fg: S.ash, b: true });
+  if (aside) t.right(x + w, y, aside, { fg: S.ash });
+}
+function item(t, x, y, w, o) {
+  const f = !!o.focused;
+  if (f) t.fill(x, y, w, 2, S.em);
+  const bg = f ? S.em : undefined;
+  const ink = f ? S.void : S.chalk;
+  const soft = f ? S.inkSoft : S.ash;
+  let nx = x + 2;
+  if (o.marker) { t.put(x + 2, y, o.marker, { fg: f ? S.void : (o.marker === "○" ? S.ash : S.chalk), bg }); nx = x + 4; }
+  t.put(nx, y, o.name, { fg: ink, bg, b: true });
+  if (o.meta) t.right(x + w - 2, y, o.meta, { fg: soft, bg });
+  if (o.sub) t.put(nx, y + 1, o.sub, { fg: soft, bg });
+  if (o.sub2) t.right(x + w - 2, y + 1, o.sub2, { fg: soft, bg });
+  if (!o.inert) {
+    t.hit(x, y, w, 2);
+    if (o.marker) t.hit(x, y, 4, 2);
+  }
+}
+function dialog(t, w, h, title, o = {}) {
+  const x = Math.floor((t.w - w) / 2);
+  const y = o.top ?? Math.max(1, Math.floor((t.h - h) / 3));
+  t.dim({ x, y, w, h });
+  t.fill(x, y, w, h, S.void);
+  box(t, x, y, w, h, S.hair, S.graphite);
+  t.put(x + 3, y + 1, title, { fg: S.chalk, b: true });
+  const cx = keycap(t, x + w - 15, y + 1, "esc");
+  t.put(cx, y + 1, " close", { fg: S.ash });
+  t.hits.push({ x: x + w - 15, y: y + 1, w: 12, h: 1, modal: true });
+  if (o.desc) t.put(x + 3, y + 2, o.desc, { fg: S.ash });
+  return { x, y, w, h, cx: x + 3, cy: y + (o.desc ? 4 : 3), cw: w - 6, by: y + h - 4 };
+}
+function modalButtons(t, d, items, hint) {
+  for (let i = d.x + 1; i < d.x + d.w - 1; i++) t.put(i, d.by - 1, "─", { fg: S.hair });
+  if (hint) t.put(d.cx, d.by + 1, hint, { fg: S.ash });
+  buttons(t, d.cx, d.by, items.map(o => ({ ...o, modal: true })), "right", d.cw);
+}
+function stepper(t, x, y, names, current) {
+  let cx = x;
+  names.forEach((name, i) => {
+    if (i) { cx = t.put(cx, y, " ", {}); for (let k = 0; k < 4; k++) t.put(cx++, y, "─", { fg: S.hair }); cx = t.put(cx, y, " ", {}); }
+    if (i < current) cx = t.put(cx, y, "✓ " + name, { fg: S.chalk });
+    else if (i === current) cx = t.put(cx, y, ` ${i + 1} ${name} `, { fg: S.void, bg: S.em, b: true });
+    else cx = t.put(cx, y, `${i + 1} ${name}`, { fg: S.ash });
+  });
+}
+function toast(t, title, sub) {
+  const w = Math.max(len(title) + 2, sub ? len(sub) : 0) + 6;
+  const x = t.w - w - 2;
+  box(t, x, 1, w, sub ? 4 : 3, S.hair, S.graphite);
+  t.line(x + 3, 2, [["✓ ", { fg: S.chalk }], [title, { fg: S.chalk, b: true }]]);
+  if (sub) t.put(x + 5, 3, sub, { fg: S.ash });
+}
+function alertBox(t, x, y, w, title, body, action) {
+  box(t, x, y, w, 4, S.dim);
+  t.line(x + 2, y + 1, [["! ", { fg: S.chalk, b: true }], [title, { fg: S.chalk, b: true }]]);
+  t.put(x + 4, y + 2, body, { fg: S.ash });
+  if (action) {
+    const start = x + w - 3 - (len(action[0]) + 2 + 1 + len(action[1]));
+    const e = keycap(t, start, y + 1, action[0]);
+    t.put(e, y + 1, " " + action[1], { fg: S.ash });
+    t.hit(start, y + 1, e - start + 1 + len(action[1]), 1);
+  }
+}
+function sidebar(t, x, blocks) {
+  t.fill(x, 0, t.w - x, t.h, S.canvas);
+  for (let y = 0; y < t.h; y++) t.put(x, y, "│", { fg: S.hair });
+  let y = 1; const cx = x + 3;
+  for (const b of blocks) {
+    if (b.title) { t.put(cx, y++, b.title, { fg: S.chalk, b: true }); if (b.sub) t.put(cx, y++, b.sub, { fg: S.ash }); continue; }
+    y++;
+    heading(t, cx, y++, b.label);
+    for (const v of b.values || []) t.put(cx, y++, v, { fg: S.chalk });
+    for (const [m, name, note] of b.items || []) {
+      const e = t.line(cx, y, [[m + " ", { fg: m === "○" ? S.ash : S.chalk }], [name, { fg: S.chalk }]]);
+      if (note) t.put(e + 1, y, note, { fg: S.ash });
+      y++;
+    }
+  }
+  t.line(cx, t.h - 2, [["dyn", { fg: S.dim }], ["ws", { fg: S.chalk, b: true }], [" 0.1.0", { fg: S.ash }]]);
+}
+function breadcrumb(t, x, y, parts) {
+  const spans = [];
+  parts.forEach((p, i) => {
+    if (i) spans.push([" / ", { fg: S.hair }]);
+    spans.push([p, { fg: i === parts.length - 1 ? S.chalk : S.ash, b: i === parts.length - 1 }]);
+  });
+  t.line(x, y, spans);
+}
+
+/* ---------- data ---------- */
+const SESSIONS = [
+  { name: "api-review", meta: "2 repos", sub: "api, worker · updated 2h ago" },
+  { name: "incident-482", meta: "3 repos", sub: "api, worker, billing-api · updated 1d ago", picked: true },
+  { name: "billing-refactor", meta: "2 repos", sub: "billing-api, web · updated 3d ago", section: "This month" },
+  { name: "release-check", meta: "4 repos", sub: "api, web, worker, infra · updated 5d ago" },
+  { name: "search-index", meta: "1 repo", sub: "search · updated 2w ago" },
+  { name: "worker-retry", meta: "2 repos", sub: "worker, api · updated 1mo ago" },
+];
+const sessionItem = (s, focused) => ({ marker: s.picked ? "●" : "○", name: s.name, meta: s.meta, sub: s.sub, focused });
+const LAUNCH_ACTIONS = [
+  { icon: "+", label: "New session", key: "ctrl+n" },
+  { icon: "≡", label: "All sessions", key: "tab" },
+  { icon: "›", label: "Commands", key: "ctrl+p" },
+];
+
+/* ---------- screens ---------- */
+function launcher(o = {}) {
+  const t = new Term(100, 30);
+  const x = 12, w = 76;
+  let y = 1;
+  if (!o.noLogo) { y += constellation(t, 20, y) + 1; }
+  field(t, x, y, w, { label: "Open a session", aside: o.value ? "2 matches · 1 selected" : "6 sessions · 1 selected", icon: "›", value: o.value, placeholder: "Search by name, repository or branch" });
+  y += 5;
+  if (o.alert) { alertBox(t, x, y, w, "billing-refactor changed elsewhere", "Another dws process renamed or edited it.", ["ctrl+r", "refresh"]); y += 5; }
+  buttons(t, x, y, LAUNCH_ACTIONS.map((a, i) => ({ ...a, strong: o.focusNew && i === 0 })));
+  y += 4;
+  const list = o.list || SESSIONS;
+  heading(t, x + 2, y, o.value ? "Matches" : "This week", o.value ? "" : "last updated first", w - 4);
+  y += 1;
+  // The focused session is a card with its keys; the rest are two-line rows,
+  // with later time sections under their own headings.
+  const focus = o.focus ?? 0;
+  let shown = 0;
+  for (const [i, s] of list.entries()) {
+    if (y + (i === focus ? 5 : 2) > t.h - 2) break;
+    if (i === focus) {
+      t.fill(x, y, w, 5, S.em);
+      t.put(x + 4, y + 1, s.name, { fg: S.void, bg: S.em, b: true });
+      t.right(x + w - 4, y + 1, s.age || "2h ago", { fg: S.inkSoft, bg: S.em });
+      t.put(x + 4, y + 2, (s.repos || s.sub.split(" · ")[0].split(", ")).join("  "), { fg: S.void, bg: S.em });
+      let cx = x + 4;
+      for (const [key, label] of [["enter", "open"], ["→", "repositories"], ["ctrl+e", "rename"]]) {
+        const start = cx;
+        cx = t.put(cx, y + 3, ` ${key} `, { fg: S.chalk, bg: S.alloy });
+        cx = t.put(cx, y + 3, ` ${label}`, { fg: S.inkSoft, bg: S.em });
+        t.hit(start, y + 3, cx - start, 1);
+        cx += 3;
+      }
+      t.hit(x, y, w, 5);
+      y += 5;
+    } else {
+      if (s.section) { y++; heading(t, x + 2, y++, s.section, "", w - 4); }
+      const repos = s.sub.split(" · ")[0];
+      item(t, x, y, w, { marker: s.picked ? "●" : "○", name: s.name, meta: s.sub.split("updated ")[1] || "", sub: repos.replace(/, /g, "  ") });
+      y += 2;
+    }
+    shown++;
+  }
+  if (list.length > shown) t.put(x + 2, y, `+${list.length - shown} more · type to filter`, { fg: S.ash });
+  t.right(98, 29, "0.1.0", { fg: S.ash });
+  if (o.toast) toast(t, ...o.toast);
+  return t;
+}
+function firstRun() {
+  const t = new Term(100, 30);
+  constellation(t, 20, 3);
+  const msg = "Create your first session";
+  t.put(Math.floor((100 - len(msg)) / 2), 12, msg, { fg: S.chalk, b: true });
+  const sub = "Pick repositories from ~/code. dws links them into one workspace.";
+  t.put(Math.floor((100 - len(sub)) / 2), 13, sub, { fg: S.ash });
+  const items = [{ icon: "+", label: "New session", key: "ctrl+n", strong: true }, { icon: "?", label: "How dws works", key: "f1" }];
+  const total = items.reduce((n, o) => n + buttonWidth(o), 0) + 2;
+  buttons(t, Math.floor((100 - total) / 2), 15, items);
+  t.line(30, 20, [["~/code", { fg: S.ash }], [" · 9 repositories found · no sessions yet", { fg: S.ash }]]);
+  t.right(98, 29, "0.1.0", { fg: S.ash });
+  return t;
+}
+function allSessions(o = {}) {
+  const t = new Term(100, 30);
+  const lw = 58;
+  breadcrumb(t, 2, 1, ["dws", "Sessions"]);
+  keyhints(t, 2, 1, lw - 2, [["tab", "launcher"]]);
+  let y = 3;
+  SESSIONS.forEach((s, i) => { item(t, 1, y, lw - 1, sessionItem(s, i === 0)); y += 2; });
+  field(t, 2, 19, lw - 4, { label: "Filter sessions", aside: "6 / 6 · 1 selected", icon: "›", placeholder: "Name, repository or branch" });
+  buttons(t, 2, 25, [{ label: "Open", key: "enter", strong: true }, { icon: "+", label: "New", key: "ctrl+n" }, { label: "Commands", key: "ctrl+p" }]);
+  sidebar(t, lw + 1, [
+    { title: "api-review", sub: "api review across the API and worker" },
+    { label: "Workspace", values: ["~/code/.dynws/workspaces/api-review"] },
+    { label: "Opens with", values: ["Cursor · cursor --new-window"] },
+    { label: "Repositories (2)", items: [["●", "api", "link · main"], ["◆", "worker", "worktree · fix-retry"]] },
+    { label: "Updated", values: ["2h ago · created Oct 21"] },
+  ]);
+  return t;
+}
+function repositories() {
+  const t = new Term(100, 30);
+  const lw = 58;
+  breadcrumb(t, 2, 1, ["dws", "api-review", "Repositories"]);
+  const rows = [
+    { marker: "●", name: "api", meta: "link · main", sub: "~/code/services/api" },
+    { marker: "◆", name: "worker", meta: "worktree · fix-retry", sub: "~/code/.dynws/worktrees/worker/fix-retry", focused: true },
+    { marker: "✕", name: "dashboard", meta: "missing", sub: "~/code/apps/dashboard · path not found" },
+  ];
+  rows.forEach((r, i) => item(t, 1, 3 + i * 2, lw - 1, r));
+  t.put(3, 10, "● link   ◆ managed worktree   ✕ missing path", { fg: S.ash });
+  buttons(t, 2, 25, [{ icon: "‹", label: "Back", key: "esc" }, { icon: "+", label: "Add", key: "ctrl+a" }, { icon: "✕", label: "Remove", key: "ctrl+d" }]);
+  sidebar(t, lw + 1, [
+    { title: "worker", sub: "managed worktree" },
+    { label: "Path", values: ["~/code/.dynws/worktrees/worker/", "fix-retry"] },
+    { label: "Source", values: ["~/code/services/worker"] },
+    { label: "Branch", values: ["fix-retry · tracks origin/fix-retry"] },
+  ]);
+  return t;
+}
+function palette(o = {}) {
+  const t = launcher();
+  const d = dialog(t, 64, 24, "Commands", { top: 2 });
+  field(t, d.cx, d.cy - 1, d.cw, { label: "", icon: "›", value: o.query, placeholder: "Search commands" });
+  const groups = o.query === "t3"
+    ? [["Open", [["Open in T3 Code", "ctrl+t", true]]]]
+    : [["Session", [["Open session", "enter", true], ["Open with…", "ctrl+o"], ["New session", "ctrl+n"], ["Rename session", "ctrl+e"], ["Delete sessions", "ctrl+d"]]],
+       ["View", [["All sessions", "tab"], ["Show repositories", "→"]]],
+       ["System", [["Keyboard help", "f1"], ["Full details", "f2"], ["Quit dws", "ctrl+c"]]]];
+  let y = d.cy + 3;
+  groups.forEach(([g, rows], gi) => {
+    if (gi) y++;
+    heading(t, d.cx, y++, g);
+    rows.forEach(([label, key, focused]) => {
+      if (focused) t.fill(d.x + 1, y, d.w - 2, 1, S.em);
+      const bg = focused ? S.em : undefined;
+      t.put(d.cx, y, label, { fg: focused ? S.void : S.chalk, bg, b: !!focused });
+      t.right(d.cx + d.cw, y, key, { fg: focused ? S.inkSoft : S.ash, bg });
+      t.hits.push({ x: d.x + 1, y, w: d.w - 2, h: 1, modal: true });
+      y++;
+    });
+  });
+  return t;
+}
+function openWith() {
+  const t = launcher();
+  const d = dialog(t, 64, 19, "Open api-review", { desc: "Choose where to open ~/code/.dynws/workspaces/api-review" });
+  const opts = [
+    { marker: "1", name: "Cursor", meta: "default", sub: "cursor --new-window", focused: true },
+    { marker: "2", name: "T3 Code", meta: "project", sub: "adds the workspace as a T3 Code project" },
+    { marker: "3", name: "Finder", meta: "reveal", sub: "show the workspace folder" },
+  ];
+  opts.forEach((o, i) => { item(t, d.x + 1, d.cy + i * 2, d.w - 2, o); t.hits[t.hits.length - 1].modal = true; t.hits[t.hits.length - 2].modal = true; });
+  t.put(d.cx, d.cy + 7, "[ ] Use this choice for every session", { fg: S.chalk });
+  t.hits.push({ x: d.cx, y: d.cy + 7, w: 37, h: 1, modal: true });
+  modalButtons(t, d, [{ label: "Cancel", key: "esc" }, { icon: "›", label: "Open", key: "enter", strong: true }], "1–3 choose");
+  return t;
+}
+function deleteDialog() {
+  const t = launcher({ focus: 1 });
+  const d = dialog(t, 66, 18, "Delete incident-482?", { desc: "This cannot be undone." });
+  heading(t, d.cx, d.cy, "Deletes");
+  t.put(d.cx + 2, d.cy + 1, "session metadata and its workspace links", { fg: S.chalk });
+  heading(t, d.cx, d.cy + 3, "Keeps");
+  t.put(d.cx + 2, d.cy + 4, "source repositories in ~/code", { fg: S.chalk });
+  t.put(d.cx + 2, d.cy + 5, "~/code/.dynws/worktrees/worker/fix-retry", { fg: S.chalk });
+  modalButtons(t, d, [{ label: "Cancel", key: "enter", strong: true }, { icon: "✕", label: "Delete", key: "y", bold: true }], "enter cancels");
+  return t;
+}
+function renameDialog() {
+  const t = launcher();
+  const d = dialog(t, 64, 14, "Rename api-review");
+  field(t, d.cx, d.cy, d.cw, { label: "Session name", value: "api-review-v2", help: "Workspace moves to ~/code/.dynws/workspaces/api-review-v2" });
+  modalButtons(t, d, [{ label: "Cancel", key: "esc" }, { icon: "✓", label: "Save", key: "enter", strong: true }]);
+  return t;
+}
+function help() {
+  const t = launcher();
+  const d = dialog(t, 76, 26, "Keyboard and mouse", { top: 2 });
+  const groups = [
+    ["Launcher", [["Open the highlighted session", "enter"], ["Open with…", "ctrl+o"], ["New session", "ctrl+n"], ["All sessions view", "tab"], ["Select for bulk actions", "ctrl+s"], ["Rename · Delete", "ctrl+e · ctrl+d"]]],
+    ["Everywhere", [["Search commands", "ctrl+p"], ["Full details", "f2"], ["Back or clear", "esc"], ["Quit", "ctrl+c"]]],
+    ["Mouse", [["Focus an item", "click"], ["Select it", "click its marker"], ["Open it", "double-click"]]],
+  ];
+  let y = d.cy;
+  groups.forEach(([g, rows], gi) => {
+    if (gi) y++;
+    heading(t, d.cx, y++, g);
+    rows.forEach(([label, key]) => { t.put(d.cx, y, label, { fg: S.chalk }); t.right(d.cx + d.cw, y, ` ${key} `, { fg: S.chalk, bg: S.alloy }); y++; });
+  });
+  return t;
+}
+const REPOS = {
+  services: [
+    { name: "api", meta: "main · dirty" },
+    { name: "worker", meta: "main" },
+    { name: "billing-api", meta: "main" },
+  ],
+  apps: [
+    { name: "dashboard", meta: "develop" },
+    { name: "web", meta: "main" },
+  ],
+};
+function createDialog(step, o = {}) {
+  const t = o.base ? o.base() : launcher({ focusNew: true });
+  const add = !!o.add;
+  const d = dialog(t, 94, 28, add ? "Add repositories to api-review" : "New session", {
+    top: 1, desc: add ? "Links more repositories into the existing workspace." : "Links repositories into one workspace. Source repositories are never modified.",
+  });
+  stepper(t, d.cx, d.cy, add ? ["Repositories", "Branches"] : ["Repositories", "Branches", "Name"], step);
+  const lw = 48, lx = d.cx, ty = d.cy + 2;
+  const rx = d.x + lw + 7;
+  for (let y = ty; y < d.by - 1; y++) t.put(rx - 3, y, "│", { fg: S.hair });
+  if (step === 0) {
+    field(t, lx, ty, lw, { label: "Repositories", aside: "2 selected · 5 of 9", icon: "›", placeholder: "Filter by name or path" });
+    let y = ty + 5;
+    heading(t, lx, y++, "services");
+    const marks = { api: ["●", "link"], worker: ["◆", "worktree"] };
+    REPOS.services.forEach(r => {
+      const [m, kind] = marks[r.name] || ["○", ""];
+      item(t, lx - 2, y, lw + 2, { marker: m, name: r.name, meta: kind, sub: r.meta, focused: r.name === "billing-api" });
+      t.hits.slice(-2).forEach(h => h.modal = true);
+      y += 2;
+    });
+    heading(t, lx, y++, "apps");
+    REPOS.apps.slice(0, 1).forEach(r => { item(t, lx - 2, y, lw + 2, { marker: "○", name: r.name, sub: r.meta }); t.hits.slice(-2).forEach(h => h.modal = true); y += 2; });
+  } else if (step === 1) {
+    field(t, lx, ty, lw, { label: "Branch for worker", aside: o.fetching ? "fetching origin…" : "24 branches", icon: "›", value: o.fetching ? "" : "fix", placeholder: "Filter branches" });
+    let y = ty + 5;
+    if (o.fetching) {
+      box(t, lx, y, lw, 4, S.dim);
+      t.line(lx + 2, y + 1, [["◐ ", { fg: S.chalk }], ["Fetching origin for worker", { fg: S.chalk, b: true }]]);
+      t.put(lx + 4, y + 2, "Branches appear when the fetch finishes.", { fg: S.ash });
+      const e = keycap(t, lx + lw - 15, y + 1, "esc");
+      t.put(e, y + 1, " cancel", { fg: S.ash });
+      t.hits.push({ x: lx + lw - 15, y: y + 1, w: 12, h: 1, modal: true });
+    } else {
+      [["fix-retry", "origin/fix-retry", true], ["fix-timeouts", "origin/fix-timeouts"], ["fix-queue-depth", "origin/fix-queue-depth"]].forEach(([n, ref, f]) => {
+        item(t, lx - 2, y, lw + 2, { name: n, sub: ref, focused: f });
+        t.hits[t.hits.length - 1].modal = true;
+        y += 2;
+      });
+      t.put(lx, y + 1, "double-click or enter chooses a branch", { fg: S.ash });
+    }
+  } else {
+    field(t, lx, ty, lw, { label: "Session name", value: "api-billing", help: "Letters, numbers and dashes. Folder: api-billing" });
+    let y = ty + 6;
+    heading(t, lx, y++, "Selected");
+    [["●", "api", "link · main"], ["◆", "worker", "worktree · fix-retry"]].forEach(([m, n, meta]) => {
+      item(t, lx - 2, y, lw + 2, { marker: m, name: n, meta, sub: m === "●" ? "~/code/services/api" : "new branch from origin/fix-retry", inert: true });
+      y += 2;
+    });
+  }
+  let y = ty;
+  heading(t, rx, y++, add ? "Will add" : "Will create");
+  y++;
+  const name = step === 2 ? "api-billing" : "<name>";
+  t.put(rx, y++, add ? "~/code/.dynws/workspaces/api-review/" : `~/code/.dynws/workspaces/${name}/`, { fg: step === 2 || add ? S.chalk : S.ash });
+  y++;
+  const branch = step === 0 || o.fetching ? "<branch>" : "fix-retry";
+  [["api", "→ ~/code/services/api", "link"], ["worker", `→ .dynws/worktrees/worker/${branch}`, "worktree"]].forEach(([n, target, kind]) => {
+    t.line(rx + 2, y, [[n, { fg: S.chalk, b: true }], ["  " + kind, { fg: S.ash }]]);
+    t.put(rx + 2, y + 1, target, { fg: branch === "<branch>" && kind === "worktree" ? S.ash : S.chalk });
+    y += 3;
+  });
+  heading(t, rx, y++, "Unchanged");
+  t.put(rx + 2, y++, "source repositories in ~/code", { fg: S.ash });
+  const back = step === 0 ? { label: "Cancel", key: "esc" } : { icon: "‹", label: "Back", key: "esc" };
+  const primary = step === 2 ? { icon: "✓", label: "Create session", key: "enter", strong: true }
+    : step === 1 ? { icon: "›", label: "Choose branch", key: "enter", strong: true }
+    : { icon: "›", label: "Next", key: "enter", strong: true };
+  const hint = step === 0 ? "ctrl+s link · ctrl+w worktree" : step === 1 ? "" : "";
+  modalButtons(t, d, [back, primary], hint);
+  return t;
+}
+function duplicate() {
+  const t = launcher({ focusNew: true });
+  const d = dialog(t, 70, 12, "Session already exists", { desc: "api-review already links api and worker on these branches." });
+  t.put(d.cx, d.cy, "Reuse it, or create a second session with the same repositories.", { fg: S.chalk });
+  modalButtons(t, d, [{ label: "Rename", key: "esc" }, { label: "Create anyway", key: "n" }, { icon: "›", label: "Reuse api-review", key: "r", strong: true }]);
+  return t;
+}
+function compact() {
+  const t = new Term(60, 20);
+  field(t, 2, 0, 56, { label: "Open a session", aside: "6 · 1 selected", icon: "›", placeholder: "Search sessions" });
+  buttons(t, 2, 5, [{ icon: "+", label: "New", key: "ctrl+n" }, { icon: "›", label: "Commands", key: "ctrl+p" }]);
+  heading(t, 4, 9, "Recent", "", 52);
+  SESSIONS.slice(0, 4).forEach((s, i) => item(t, 2, 10 + i * 2, 56, sessionItem(s, i === 0)));
+  t.put(4, 18, "+2 more · type to filter", { fg: S.ash });
+  return t;
+}
+function t3Confirm() {
+  const t = launcher();
+  const d = dialog(t, 76, 17, "Open api-review in T3 Code", { desc: "dws adds the workspace as a T3 Code project, then opens it." });
+  heading(t, d.cx, d.cy, "Runs");
+  t.put(d.cx + 2, d.cy + 1, "~/.t3/bin/t3 app ~/code/.dynws/workspaces/api-review", { fg: S.chalk });
+  t.put(d.cx + 2, d.cy + 2, "A missing project is added by the desktop app.", { fg: S.ash });
+  t.put(d.cx, d.cy + 4, "[x] Open sessions in T3 Code from now on", { fg: S.chalk });
+  t.hits.push({ x: d.cx, y: d.cy + 4, w: 41, h: 1, modal: true });
+  modalButtons(t, d, [{ label: "Cancel", key: "enter", strong: true }, { icon: "›", label: "Open", key: "y" }]);
+  return t;
+}
+function shell(lines) {
+  const t = new Term(100, 12);
+  lines.forEach(([s, fg, b], i) => t.put(2, 1 + i, s, { fg: fg || S.chalk, b }));
+  return t;
+}
+
+/* ---------- page assembly ---------- */
+const REG = [];
+function frame(build, label, anim = false) {
+  const t = build();
+  const i = REG.push(build) - 1;
+  return `<div class="frame"><div class="frame-bar"><span>${esc(label)}</span><span>${t.w} × ${t.h}</span></div><div class="scroll"><div class="screen" data-i="${i}"${anim ? " data-anim" : ""} style="--cols:${t.w}">${t.html()}</div></div></div>`;
+}
+const VIEWS = [
+  ["Launcher home", "The default screen. The constellation signature sits above the search field; the three main actions are buttons, and recent sessions sit below as two-row items.", () => launcher(), "dws", true],
+  ["Launcher · filtering with an alert", "Typing filters every session. A problem with a session stays as an inline alert until you act on it.", () => launcher({ value: "bill", list: [SESSIONS[2], SESSIONS[1]], alert: true, noLogo: true }), "dws"],
+  ["First run", "No sessions yet: one clear next step, plus help.", firstRun, "dws", true],
+  ["All sessions", "Tab switches to the full manager: a dense list with details on the right.", allSessions, "dws · all sessions"],
+  ["Session repositories", "→ on a session lists its repositories. Each item is marked as a link, a managed worktree or a missing path, in shape and words.", repositories, "dws · api-review"],
+  ["Command palette", "ctrl+p lists every action, grouped, with its key.", () => palette(), "dws"],
+  ["Open with", "ctrl+o chooses where the workspace opens: your editor, T3 Code or Finder.", openWith, "dws"],
+  ["Delete confirmation", "Says what is deleted and what stays on disk. Enter cancels; y deletes.", deleteDialog, "dws"],
+  ["Rename", "The new workspace path is shown before you save.", renameDialog, "dws"],
+  ["Keyboard and mouse help", "f1. Keys sit in keycaps on the right.", help, "dws"],
+  ["New session · repositories", "Step 1. Repositories are grouped by folder. The right column shows exactly what will be created.", () => createDialog(0), "dws new"],
+  ["New session · branches (fetching)", "Step 2 while origin is fetched. The list keeps filtering; esc cancels the fetch.", () => createDialog(1, { fetching: true }), "dws new"],
+  ["New session · name", "Step 3. The tree now shows final paths.", () => createDialog(2), "dws new"],
+  ["Session already exists", "Reusing is the default when the same repositories are already linked.", duplicate, "dws new"],
+  ["Add repositories", "The same dialog, scoped to an existing session.", () => createDialog(0, { add: true, base: () => repositories() }), "dws · api-review"],
+  ["Compact launcher", "Below 100 × 24 the logo goes; the actions and two-row items stay.", compact, "dws"],
+];
+const FLOWS = [
+  ["Open a session", "From the shell to an editor in three keys.", [
+    ["Run dws", "dws", () => launcher(), "The launcher opens with the search field focused.", true],
+    ["Type to filter", "a p i", () => launcher({ value: "api", list: [SESSIONS[0], SESSIONS[5]], noLogo: true }), "Matches update as you type. Enter opens the highlighted session; ctrl+o asks where."],
+    ["Choose where (optional)", "ctrl+o", openWith, "Cursor is the default. Tick the box to stop asking."],
+    ["Editor opens", "enter", () => shell([["~/code $ dws", S.ash], ["Opened api-review in Cursor", S.chalk, true], ["~/code/.dynws/workspaces/api-review", S.ash], ["~/code $ ", S.ash]]), "dws restores the terminal, starts the editor and waits for it."],
+  ]],
+  ["Create a session", "Pick repositories, choose a branch for the worktree, name it, then open it.", [
+    ["Start", "ctrl+n or click New session", () => launcher({ focusNew: true }), "The New session button is a three-row target.", true],
+    ["Pick repositories", "ctrl+s link · ctrl+w worktree", () => createDialog(0), "api is linked as it is; worker becomes a managed worktree. The right column fills in."],
+    ["Fetch and choose a branch", "enter", () => createDialog(1, { fetching: true }), "dws fetches origin for worker. You can keep filtering, or press esc to cancel."],
+    ["Pick the branch", "enter or double-click", () => createDialog(1), "fix-retry becomes the worktree's branch, and the tree updates."],
+    ["Name it", "type, then enter", () => createDialog(2), "The folder name is shown before anything is written."],
+    ["Done", "enter", () => launcher({ toast: ["Created api-billing", "~/code/.dynws/workspaces/api-billing"], list: [{ name: "api-billing", meta: "2 repos", sub: "api, worker · created just now" }, ...SESSIONS.slice(0, 4)] }), "The new session is first in Recent and focused. Enter opens it."],
+  ]],
+  ["Open in T3 Code", "Make the workspace a T3 Code project and open it.", [
+    ["Find the command", "ctrl+p, then type t3", () => palette({ query: "t3" }), "It also appears in Open with and after creating a session."],
+    ["Confirm the first time", "enter", t3Confirm, "dws shows the exact commands before running them."],
+    ["T3 Code opens", "", () => launcher({ toast: ["Opened api-review in T3 Code", "project: api-review"] }), "Errors from t3 show as an inline alert, with the output in f2 details."],
+  ]],
+];
+
+function sigPreview() {
+  const t = new Term(64, 9);
+  constellation(t, 2, 1);
+  return t;
+}
+function renderAll() {
+  REG.length = 0;
+  document.getElementById("sig-preview").innerHTML = frame(sigPreview, "constellation", true);
+  document.getElementById("view-list").innerHTML = VIEWS.map(([title, caption, build, label, anim]) =>
+    `<article class="view"><div class="view-head"><h3>${esc(title)}</h3><p class="soft">${esc(caption)}</p></div>${frame(build, label, anim)}</article>`).join("");
+  document.getElementById("flow-list").innerHTML = FLOWS.map(([title, intro, steps]) =>
+    `<div class="flow"><div class="block-head"><h3>${esc(title)}</h3><p class="soft">${esc(intro)}</p></div><ol class="steps">` +
+    steps.map(([name, key, build, caption, anim], i) =>
+      `<li class="step"><div class="step-label"><span class="n">${i + 1}</span><h3>${esc(name)}</h3>${key ? `<span class="key">${esc(key)}</span>` : ""}</div><p class="soft">${esc(caption)}</p>${frame(build, "dws", anim)}</li>`).join("") +
+    "</ol></div>").join("");
+  observe();
+}
+
+const visible = new Set();
+const watcher = "IntersectionObserver" in window
+  ? new IntersectionObserver(entries => entries.forEach(e => e.isIntersecting ? visible.add(e.target) : visible.delete(e.target)))
+  : null;
+function observe() {
+  visible.clear();
+  document.querySelectorAll(".screen[data-anim]").forEach(el => watcher ? watcher.observe(el) : visible.add(el));
+}
+let last = 0;
+function tick(now) {
+  if (!STILL.matches && now - last >= 80) {
+    last = now;
+    FRAME++;
+    for (const el of visible) { if (el.isConnected) el.innerHTML = REG[+el.dataset.i]().html(); }
+  }
+  requestAnimationFrame(tick);
+}
+STILL.addEventListener?.("change", renderAll);
+renderAll();
+requestAnimationFrame(tick);
+
+const toggle = document.getElementById("show-hits");
+try { toggle.checked = localStorage.getItem("dws-show-hits") === "1"; } catch (_) {}
+const applyHits = () => {
+  document.body.classList.toggle("show-hits", toggle.checked);
+  try { localStorage.setItem("dws-show-hits", toggle.checked ? "1" : "0"); } catch (_) {}
+};
+toggle.addEventListener("change", applyHits);
+applyHits();
+</script>
+</body>
+</html>

@@ -126,6 +126,23 @@ pub fn resolve_file_manager(
     }
 }
 
+/// Starts the editor in its own process group with no terminal I/O and does
+/// not wait, so the shell is usable while a slow editor starts.
+pub fn launch_detached(command: &LaunchCommand, path: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    Command::new(&command.command)
+        .args(&command.args)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("failed to start {}", command.command_line()))?;
+    Ok(())
+}
+
 pub fn launch(command: &LaunchCommand, path: &Path, wait: bool) -> Result<()> {
     let mut process = Command::new(&command.command);
     process.args(&command.args).arg(path);
@@ -244,16 +261,16 @@ fn command_line(command: &str, args: &[&str]) -> String {
 
 fn quote_command_part(part: &str) -> String {
     if !part.is_empty()
-        && !part.chars().any(|character| {
-            character.is_whitespace() || character == '\'' || character == '"' || character == '\\'
-        })
+        && part
+            .chars()
+            .all(|character| character.is_alphanumeric() || "/._-:=+@".contains(character))
     {
         return part.to_string();
     }
 
     let mut quoted = String::from("\"");
     for character in part.chars() {
-        if character == '"' || character == '\\' {
+        if matches!(character, '"' | '\\' | '$' | '`') {
             quoted.push('\\');
         }
         quoted.push(character);

@@ -58,6 +58,12 @@ pub enum Commands {
     },
     /// Initialize or repair this repository collection.
     Init,
+    /// Print shell integration: completion plus a `dws` function that can cd
+    /// into an opened workspace. Add `eval "$(dws shell-init zsh)"` to ~/.zshrc.
+    ShellInit {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
     /// Create a workspace from a JSON or TOML manifest without prompts or editor launch.
     #[command(after_help = "Examples:
   dws create --file workspace.json
@@ -106,8 +112,22 @@ fully qualified refs/heads/... and refs/remotes/... disambiguate branch names.")
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ConfigKey {
+    /// Where sessions open: editor, t3 or finder.
+    Opener,
+    /// Editor command used to open sessions.
     Editor,
+    /// File manager command used by `dws reveal`.
     FileManager,
+    /// on/off: start the editor in the background so the terminal stays free.
+    Background,
+    /// on/off: move the shell into the workspace (needs `dws shell-init`).
+    Cd,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Shell {
+    Zsh,
+    Bash,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -121,6 +141,7 @@ pub enum ConfigCommands {
     Set {
         #[arg(value_enum)]
         key: ConfigKey,
+        /// A command line for editor/file-manager, or on/off for background/cd.
         command: String,
     },
     /// Clear a saved launch command.

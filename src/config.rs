@@ -220,6 +220,29 @@ pub struct Config {
     pub editor: EditorConfig,
     #[serde(default)]
     pub file_manager: FileManagerConfig,
+    #[serde(default, skip_serializing_if = "OpenConfig::is_default")]
+    pub open: OpenConfig,
+}
+
+/// How `dws` opens a session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opener: Option<crate::opener::Opener>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub t3_confirmed: bool,
+    /// Start the editor in the background and return to the shell at once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
+    /// Move the shell into the workspace (needs `dws shell-init`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cd: bool,
+}
+
+impl OpenConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -749,11 +772,19 @@ mod tests {
             file_manager: FileManagerConfig {
                 default: Some("open".to_string()),
             },
+            open: OpenConfig {
+                background: true,
+                cd: true,
+                ..OpenConfig::default()
+            },
         };
 
         config.save(&paths).unwrap();
 
         assert_eq!(Config::load(&paths).unwrap(), config);
+        // Configs written before the open settings existed still load, off.
+        fs::write(&paths.config_file, "[editor]\ndefault = \"code\"\n").unwrap();
+        assert_eq!(Config::load(&paths).unwrap().open, OpenConfig::default());
         assert!(!fs::read_dir(&paths.home).unwrap().any(|entry| {
             entry
                 .unwrap()

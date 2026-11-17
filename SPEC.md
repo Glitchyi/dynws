@@ -13,7 +13,8 @@ project storage as a side effect.
 
 ## Command surface
 
-- `dws` opens the session manager, including an actionable empty home screen.
+- `dws` opens the session manager on a launcher home (search, main actions,
+  recent sessions), including an actionable empty state.
 - `dws new [--editor COMMAND | --no-open]` runs guided creation, then opens the
   workspace unless launch was disabled.
 - `dws open SESSION [--editor COMMAND]` opens an existing session.
@@ -23,6 +24,11 @@ project storage as a side effect.
 - `dws reveal SESSION` reveals a workspace in its saved or detected file manager.
 - `dws config set <editor|file-manager> COMMAND` and `dws config clear
   <editor|file-manager>` manage saved launch commands.
+- `dws config set opener <editor|t3|finder>` saves the opening destination;
+  `dws config clear opener` restores editor opening.
+- `dws config set <background|cd> <on|off>` and `dws config clear
+  <background|cd>` control detached editor opening and shell directory changes.
+- `dws shell-init <zsh|bash>` prints completion plus the directory-change wrapper.
 - `dws config list file-manager` lists detected file-manager commands.
 - `dws init` initializes, validates, or repairs the current collection.
 - `dws create --file FILE [--input-format json|toml] [--project PATH] [--fetch]
@@ -31,8 +37,10 @@ project storage as a side effect.
 
 `manage`, old setting-first config commands, and root-level creation flags are
 removed without aliases. Stored formats remain compatible. There is no editor
-catalog/detection/picker: explicit launch command precedes the saved default.
-Editor launches inherit stdio and are waited for after terminal restoration.
+catalog/detection: explicit launch command precedes the saved default, with
+Cursor as the fallback. Open with selects a destination rather than detecting
+editors. Foreground editor launches inherit stdio and wait after terminal
+restoration; background editor launches detach with null stdio.
 
 ## Shell completion
 
@@ -272,6 +280,17 @@ repository summaries give a remaining count and the route to the full view.
 Expanded-session previews follow the highlighted repository. F2 reuses the same
 detail model and provides complete scrollable text. Counts describe the active
 list and remain visible beside separate operation/error feedback.
+
+Ctrl+O chooses the configured editor (Cursor when unset), T3 Code, or the
+configured desktop file manager. Space toggles persistence; 1–3 and arrows
+choose an opener; Esc cancels without saving. Ctrl+T invokes T3 directly.
+The first T3 invocation displays the exact argument-vector command and requires
+y; Enter cancels. `~/.t3/bin/t3 app <workspace>` owns project registration and
+opening; dws never writes T3's database. GUI subprocess work stays off the render
+thread, prevents overlapping actions, and exposes failures and output in F2.
+Terminal editors launch after terminal teardown. Remembered openers apply to
+CLI opening and interactive creation; explicit --editor wins. Config changes
+from a stale Open with dialog are rejected before launch.
 
 Dialogs use a bounded centered surface when space allows and the available
 content region otherwise. They clear underlying content, retain complete
