@@ -6,6 +6,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Shared session publication
+
+- Manifest and interactive creation now share one store-owned filesystem
+  publication transaction and owned-worktree rollback. Metadata publication is
+  the commit point; unexpected files and metadata are never overwritten.
+- Preserve strict manifest paths, branch rules and creation provenance, plus
+  interactive worktree reuse, fallback branches and duplicate prompts. Strict
+  `--reuse` eligibility and existing workspace layouts are unchanged.
+
 ### Confirmed workspace cleanup
 
 - Session deletion can now remove extra workspace files and folders after a

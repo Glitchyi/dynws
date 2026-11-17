@@ -49,7 +49,12 @@ pub fn run_interactive(paths: &DynwsPaths, cwd: &Path) -> Result<RepoFlowOutcome
     }
     app.set_repos(repos);
     app.message.clear();
-    run_app(terminal.terminal_mut(), &mut app)
+    let outcome = run_app(terminal.terminal_mut(), &mut app);
+    drop(terminal);
+    for warning in app.creation_warnings {
+        eprintln!("warning: {warning}");
+    }
+    outcome
 }
 
 pub struct ManagerOutcome {
@@ -203,6 +208,12 @@ fn run_session_manager_app(
                 picker.backdrop = Some(backdrop);
                 match run_app(terminal, &mut picker)? {
                     RepoFlowOutcome::Completed(session) => {
+                        app.changes.extend(
+                            picker
+                                .creation_warnings
+                                .iter()
+                                .map(|warning| format!("warning: {warning}")),
+                        );
                         app.changes.push(format!(
                             "session ready: {} ({})",
                             session.name,
@@ -561,6 +572,7 @@ fn folder_tree(path: &Path) -> Vec<String> {
 }
 
 struct App {
+    creation_warnings: Vec<String>,
     repos: Vec<RepoCandidate>,
     /// The folder of each repository, parallel to `repos`; see `set_repos`.
     repo_groups: Vec<String>,
@@ -587,6 +599,7 @@ impl App {
     fn new(repos: Vec<RepoCandidate>, store: SessionStore) -> Self {
         let repo_groups = repo_groups(&repos, &store.paths().collection_root);
         Self {
+            creation_warnings: Vec::new(),
             repos,
             repo_groups,
             selected: BTreeSet::new(),
@@ -1706,47 +1719,41 @@ impl App {
             return Ok(AppSignal::Continue);
         }
 
-        let store = self.store.locked()?;
-        let materialized = self.materialize_selections()?;
-        let selected = &materialized.selections;
-        if !allow_duplicate {
-            let selected_paths = selected
-                .iter()
-                .map(|selection| selection.path.clone())
-                .collect::<Vec<_>>();
-            let duplicate = match store.find_duplicate(&selected_paths) {
-                Ok(duplicate) => duplicate,
-                Err(error) => {
-                    let cleanup = rollback_created_worktrees(&materialized.created_worktrees);
-                    self.message = format!(
-                        "Error: {error:#}{}",
-                        cleanup
-                            .map(|warning| format!("; {warning}"))
-                            .unwrap_or_default()
-                    );
-                    return Ok(AppSignal::Continue);
-                }
-            };
-            if let Some(existing) = duplicate {
-                let cleanup = rollback_created_worktrees(&materialized.created_worktrees);
+        let links = self
+            .selected
+            .iter()
+            .map(|index| {
+                let repo = &self.repos[*index];
+                RepoSelection::link(repo.name.clone(), repo.path.clone())
+            })
+            .collect::<Vec<_>>();
+        let worktrees = self
+            .worktree_choices
+            .iter()
+            .map(|choice| {
+                let repo = &self.repos[choice.repo_idx];
+                (repo.name.clone(), repo.path.clone(), choice.branch.clone())
+            })
+            .collect::<Vec<_>>();
+        match self.store.create_session_from_choices(
+            &self.session_name,
+            &links,
+            &worktrees,
+            allow_duplicate,
+        ) {
+            Ok((crate::session::CreateOutcome::Reused(existing), warnings)) if !allow_duplicate => {
                 self.mode = Mode::Duplicate { existing };
-                if let Some(cleanup) = cleanup {
-                    self.message = cleanup;
-                }
-                return Ok(AppSignal::Continue);
+                self.message = warnings.join("; ");
+                Ok(AppSignal::Continue)
             }
-        }
-
-        match store.create_session_with_links(&self.session_name, selected, None, allow_duplicate) {
-            Ok(outcome) => Ok(AppSignal::Done(RepoFlowOutcome::Completed(
-                outcome.into_metadata(),
-            ))),
+            Ok((outcome, warnings)) => {
+                self.creation_warnings = warnings;
+                Ok(AppSignal::Done(RepoFlowOutcome::Completed(
+                    outcome.into_metadata(),
+                )))
+            }
             Err(error) => {
-                let cleanup = rollback_created_worktrees(&materialized.created_worktrees);
                 self.message = format!("Error: {error:#}");
-                if let Some(cleanup) = cleanup {
-                    self.message = format!("{}; {cleanup}", self.message);
-                }
                 Ok(AppSignal::Continue)
             }
         }

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::config::DynwsPaths;
 use crate::git::{self, StrictBranch};
 use crate::manifest::{self, CreationRecord, InputFormat};
+use crate::publication::{exists, validate_strict_identity as validate_identity};
 use crate::session::{RepoKind, RepoLink, SessionMetadata, SessionStore};
 
 #[derive(Debug, Serialize)]
@@ -128,124 +129,26 @@ pub fn create(
             branch,
         });
     }
-    let workspace = store.workspace_path(&name);
-    let nonce = format!(
-        "{}.{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let stage = paths.workspaces_dir.join(format!(".{name}.{nonce}.create"));
-    let staged_metadata = paths.sessions_dir.join(format!(".{name}.{nonce}.create"));
     let timestamp = chrono::Utc::now().to_rfc3339();
     let metadata = SessionMetadata {
         creation: Some(record),
         name,
         description: None,
-        repos: plans.iter().map(|p| p.link.clone()).collect(),
+        repos: plans.iter().map(|plan| plan.link.clone()).collect(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
     };
-    let serialized = toml::to_string_pretty(&metadata)?;
-    // Prepare the complete result before any mutations, including UTF-8/serialization checks.
-    let success = result(paths, &metadata, "created")?;
-    let mut attempted = Vec::new();
-    let mut workspace_published = false;
-    let mut stage_created = false;
-    let mut metadata_staged = false;
-    let operation = (|| -> Result<()> {
-        fs::create_dir(&stage)?;
-        stage_created = true;
-        for plan in &plans {
-            if let Some(branch) = &plan.branch {
-                // Reserve an absent target so Git cannot adopt a directory that appeared
-                // after preflight. Git accepts an existing empty worktree directory.
-                fs::create_dir(&plan.link.path).context("worktree target reservation failed")?;
-                attempted.push((plan, false));
-                git::strict_add(
-                    Path::new(plan.link.source_repo.as_deref().context("missing source")?),
-                    Path::new(&plan.link.path),
-                    branch,
-                )?;
-                attempted.last_mut().expect("tracked worktree attempt").1 = true;
-                validate_identity(&plan.link)?;
-            }
-            std::os::unix::fs::symlink(&plan.link.path, stage.join(&plan.link.name))?;
-        }
-        let mut staged = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged_metadata)?;
-        metadata_staged = true;
-        use std::io::Write;
-        staged.write_all(serialized.as_bytes())?;
-        staged.sync_all()?;
-        if exists(&session_file)? || exists(&workspace)? {
-            bail!("workspace publication collision");
-        }
-        // mkdir reserves the final name without replacing any existing directory.
-        fs::create_dir(&workspace)?;
-        workspace_published = true;
-        // Replace only our empty reservation. Rename refuses a directory containing
-        // unexpected entries and publishes all links together.
-        fs::rename(&stage, &workspace)?;
-        // Hard-link publication is atomic and refuses to overwrite existing metadata.
-        fs::hard_link(&staged_metadata, &session_file)?;
-        Ok(())
-    })();
-    if let Err(error) = operation {
-        let mut retained = Vec::new();
-        if workspace_published {
-            cleanup_links(&workspace, &metadata.repos, &mut retained);
-        }
-        if stage_created {
-            cleanup_links(&stage, &metadata.repos, &mut retained);
-        }
-        for (plan, created) in attempted.into_iter().rev() {
-            let path = Path::new(&plan.link.path);
-            if exists(path).unwrap_or(true) {
-                let cleanup = if created {
-                    validate_identity(&plan.link).and_then(|()| git::remove_worktree(path))
-                } else {
-                    fs::remove_dir(path).context(
-                        "creation did not complete; retained nonempty target for inspection",
-                    )
-                };
-                if let Err(e) = cleanup {
-                    retained.push(format!("retained worktree {}: {e:#}", path.display()));
-                }
-            }
-            if plan.branch.as_ref().is_some_and(|b| b.create) {
-                retained.push(format!("branch '{}' may have been created and is retained in {}; retry only after inspecting it, or explicitly select it with branch", plan.link.local_branch.as_deref().unwrap_or_default(), plan.link.source_repo.as_deref().unwrap_or_default()));
-            }
-        }
-        if let Err(e) = if metadata_staged {
-            remove_file_if_present(&staged_metadata)
-        } else {
-            Ok(())
-        } {
-            retained.push(format!(
-                "retained metadata staging file {}: {e}",
-                staged_metadata.display()
-            ));
-        }
-        bail!(
-            "{error:#}{}",
-            if retained.is_empty() {
-                String::new()
-            } else {
-                format!("\n{}", retained.join("\n"))
-            }
-        );
-    }
-    // The committed workspace is valid even if its extra staging name cannot be removed.
-    let mut success = success;
-    if let Err(e) = fs::remove_file(&staged_metadata) {
-        success.warnings.push(format!(
-            "retained staging file {}: {e}",
-            staged_metadata.display()
-        ));
-    }
-    drop(store);
+    // Prepare output before any writes, preserving the strict manifest contract.
+    let mut success = result(paths, &metadata, "created")?;
+    let worktrees = plans
+        .iter()
+        .filter_map(|plan| {
+            plan.branch
+                .as_ref()
+                .map(|branch| (plan.link.clone(), branch.clone()))
+        })
+        .collect::<Vec<_>>();
+    success.warnings = store.publish_strict_session(&metadata, &worktrees)?;
     Ok(success)
 }
 
@@ -254,58 +157,6 @@ fn utf8(path: &Path) -> Result<String> {
         .map(str::to_owned)
         .context("workspace paths must be valid UTF-8 for JSON/TOML metadata")
 }
-fn exists(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
-}
-
-fn cleanup_links(path: &Path, repos: &[RepoLink], warnings: &mut Vec<String>) {
-    for repo in repos {
-        let link = path.join(&repo.name);
-        if fs::read_link(&link).ok().as_deref() == Some(Path::new(&repo.path))
-            && let Err(e) = fs::remove_file(&link)
-        {
-            warnings.push(format!("retained link {}: {e}", link.display()));
-        }
-    }
-    if let Err(e) = fs::remove_dir(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warnings.push(format!(
-            "retained staging/workspace directory {}: {e}",
-            path.display()
-        ));
-    }
-}
-
-fn validate_identity(repo: &RepoLink) -> Result<()> {
-    let path = Path::new(&repo.path);
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        bail!("managed target is a symlink");
-    }
-    let info =
-        git::inspect_worktree(path)?.context("target is not a registered linked worktree")?;
-    if Some(utf8(&info.source_repo)?) != repo.source_repo
-        || info.local_branch != repo.local_branch
-        || (repo.remote_ref.is_some() && info.upstream != repo.remote_ref)
-    {
-        bail!(
-            "managed worktree source, branch or upstream identity changed: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
 fn validate_reuse(
     paths: &DynwsPaths,
     session: &SessionMetadata,

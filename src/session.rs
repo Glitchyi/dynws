@@ -225,6 +225,44 @@ impl SessionStore {
         &self.paths
     }
 
+    pub fn publish_strict_session(
+        &self,
+        metadata: &SessionMetadata,
+        worktrees: &[(RepoLink, git::StrictBranch)],
+    ) -> Result<Vec<String>> {
+        let store = self.locked()?;
+        crate::publication::Resources::run(|resources| {
+            crate::publication::publish(&store.paths, metadata, || {
+                for (link, branch) in worktrees {
+                    resources.strict(link, branch)?;
+                }
+                validate_session_metadata(metadata, &metadata.name, &store.paths)
+            })
+        })
+    }
+
+    pub fn create_session_from_choices(
+        &self,
+        name: &str,
+        links: &[RepoSelection],
+        worktrees: &[(String, PathBuf, git::OriginBranch)],
+        allow_duplicate: bool,
+    ) -> Result<(CreateOutcome, Vec<String>)> {
+        let store = self.locked()?;
+        crate::publication::Resources::run(|resources| {
+            let mut selections = links.to_vec();
+            for (name, source, branch) in worktrees {
+                selections.push(resources.interactive(name, source, &store.paths, branch)?);
+            }
+            let (outcome, mut warnings) =
+                store.create_links_with_warnings(name, &selections, None, allow_duplicate)?;
+            if matches!(outcome, CreateOutcome::Reused(_)) {
+                warnings.extend(resources.rollback());
+            }
+            Ok((outcome, warnings))
+        })
+    }
+
     pub fn workspace_path(&self, session: &str) -> PathBuf {
         self.paths.workspaces_dir.join(session)
     }
@@ -761,6 +799,7 @@ impl SessionStore {
         self.create_session_with_links(requested_name, &selections, description, allow_duplicate)
     }
 
+    #[cfg(test)]
     pub fn create_session_with_links(
         &self,
         requested_name: &str,
@@ -768,8 +807,19 @@ impl SessionStore {
         description: Option<String>,
         allow_duplicate: bool,
     ) -> Result<CreateOutcome> {
+        self.create_links_with_warnings(requested_name, repos, description, allow_duplicate)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn create_links_with_warnings(
+        &self,
+        requested_name: &str,
+        repos: &[RepoSelection],
+        description: Option<String>,
+        allow_duplicate: bool,
+    ) -> Result<(CreateOutcome, Vec<String>)> {
         if self.lock.is_none() {
-            return self.locked()?.create_session_with_links(
+            return self.locked()?.create_links_with_warnings(
                 requested_name,
                 repos,
                 description,
@@ -783,7 +833,7 @@ impl SessionStore {
             .collect::<Vec<_>>();
 
         if !allow_duplicate && let Some(existing) = self.find_duplicate(&repo_paths)? {
-            return Ok(CreateOutcome::Reused(existing));
+            return Ok((CreateOutcome::Reused(existing), Vec::new()));
         }
 
         let name = normalize_name(requested_name)?;
@@ -791,7 +841,7 @@ impl SessionStore {
         if session_file.exists() {
             let existing = self.load_session(&name)?;
             if metadata_repo_set(&existing).as_ref() == Some(&repo_paths) {
-                return Ok(CreateOutcome::Reused(existing));
+                return Ok((CreateOutcome::Reused(existing), Vec::new()));
             }
             bail!("session '{name}' already exists with a different repo set");
         }
@@ -800,60 +850,21 @@ impl SessionStore {
         if fs::symlink_metadata(&workspace).is_ok() {
             bail!("workspace target already exists: {}", workspace.display());
         }
-        let staged_workspace = self.paths.workspaces_dir.join(format!(
-            ".{name}.{}.{}.create",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        fs::create_dir(&staged_workspace)
-            .with_context(|| format!("failed to create {}", staged_workspace.display()))?;
-
-        let mut link_names = HashSet::new();
-        let mut repo_links = Vec::new();
-        for repo in &canonical_repos {
-            validate_link_name(&repo.name)?;
-            if !link_names.insert(repo.name.clone()) {
-                bail!(
-                    "multiple selected repos would create the same link name '{}'",
-                    repo.name
-                );
-            }
-
-            let link_path = staged_workspace.join(&repo.name);
-            if let Err(error) = create_symlink(&repo.path, &link_path) {
-                let _ = fs::remove_dir_all(&staged_workspace);
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to link {} -> {}",
-                        link_path.display(),
-                        repo.path.display()
-                    )
-                });
-            }
-            repo_links.push(repo_link_from_selection(repo));
-        }
-
         let timestamp = Utc::now().to_rfc3339();
         let metadata = SessionMetadata {
             creation: None,
             name,
             description,
-            repos: repo_links,
+            repos: canonical_repos
+                .iter()
+                .map(repo_link_from_selection)
+                .collect(),
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
-        if let Err(error) = self.write_session_metadata(&metadata) {
-            let _ = fs::remove_dir_all(&staged_workspace);
-            return Err(error);
-        }
-        if let Err(error) = fs::rename(&staged_workspace, &workspace) {
-            let _ = fs::remove_file(self.session_file(&metadata.name));
-            let _ = fs::remove_dir_all(&staged_workspace);
-            return Err(error)
-                .with_context(|| format!("failed to publish {}", workspace.display()));
-        }
-
-        Ok(CreateOutcome::Created(metadata))
+        validate_session_metadata(&metadata, &metadata.name, &self.paths)?;
+        let warnings = crate::publication::publish(&self.paths, &metadata, || Ok(()))?;
+        Ok((CreateOutcome::Created(metadata), warnings))
     }
 
     fn write_session_metadata(&self, metadata: &SessionMetadata) -> Result<()> {

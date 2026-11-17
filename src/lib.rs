@@ -7,6 +7,7 @@ mod editor;
 mod git;
 mod manifest;
 mod opener;
+mod publication;
 mod session;
 mod tui;
 
