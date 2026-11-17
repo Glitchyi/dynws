@@ -26,7 +26,37 @@ struct ProjectMarker {
     collection_root: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct MutationLock(fs::File);
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        // A concurrent fork can inherit the descriptor until exec. Explicit
+        // unlock keeps that child from extending a completed mutation's lock.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 impl DynwsPaths {
+    pub fn mutation_lock(&self) -> Result<MutationLock> {
+        use fs2::FileExt;
+        let path = self.home.join("create.lock");
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (!metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            bail!("creation lock is not a regular file: {}", path.display());
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.try_lock_exclusive()
+            .context("another session mutation is in progress; refresh and retry")?;
+        Ok(MutationLock(file))
+    }
+
     /// Resolve the initialized project that contains the current directory.
     ///
     /// Unlike initialization, resolution never creates or repairs files.
@@ -156,7 +186,7 @@ impl DynwsPaths {
         Self::load_initialized(home)
     }
 
-    fn load_initialized(home: &Path) -> Result<Self> {
+    pub(crate) fn load_initialized(home: &Path) -> Result<Self> {
         let project_file = home.join(PROJECT_FILE_NAME);
         let marker = read_project_marker(&project_file)?;
         let collection_root = validate_marker(&marker, &project_file)?;
@@ -540,9 +570,7 @@ fn validate_legacy_layout(home: &Path) -> Result<()> {
                             source_repo.display()
                         );
                     }
-                    if repo.remote_ref.as_deref().is_none_or(str::is_empty)
-                        || repo.local_branch.as_deref().is_none_or(str::is_empty)
-                    {
+                    if repo.local_branch.as_deref().is_none_or(str::is_empty) {
                         bail!("legacy worktree '{}' is missing branch metadata", repo.name);
                     }
                     if !canonical_path_is_within(&repo.path, &worktrees_dir) {
@@ -691,6 +719,19 @@ fn canonical_path_is_within(path: &Path, root: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_unlock_releases_a_lock_even_with_an_inherited_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = super::DynwsPaths::from_home(temp.path().join(".dynws"));
+        let guard = paths.mutation_lock().unwrap();
+        let inherited = guard.0.try_clone().unwrap();
+        assert!(paths.mutation_lock().is_err());
+        drop(guard);
+        let next = paths.mutation_lock().unwrap();
+        drop(inherited);
+        drop(next);
+    }
+
     use super::*;
 
     fn initialized_paths(temp: &tempfile::TempDir) -> DynwsPaths {

@@ -23,11 +23,16 @@ Run the same checks used by CI before opening a pull request:
 
 ```sh
 cargo fmt --all -- --check
+rustfmt --edition 2024 --check src/lib.rs
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
+python3 scripts/verify_terminal.py
 cargo build --release --locked
 cargo package --locked
 ```
+
+The PTY checks require Python 3, Zsh, and Bash and use disposable projects; they
+never initialize the source checkout or change shell dotfiles.
 
 CI runs these commands on Ubuntu and macOS with both Rust 1.88 and stable. It
 also audits `Cargo.lock` for known vulnerabilities.

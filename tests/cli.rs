@@ -197,7 +197,7 @@ fn operational_commands_find_the_nearest_initialized_ancestor() {
     dws()
         .current_dir(&nested)
         .env_remove("DYNWS_HOME")
-        .args(["config", "editor", "clear"])
+        .args(["config", "clear", "editor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("already unset"));
@@ -222,7 +222,7 @@ fn dynws_home_is_exact_and_uses_its_recorded_collection_root() {
     dws()
         .current_dir(&elsewhere)
         .env("DYNWS_HOME", &home)
-        .args(["config", "editor", "clear"])
+        .args(["config", "clear", "editor"])
         .assert()
         .success();
 
@@ -237,7 +237,7 @@ fn dynws_home_is_exact_and_uses_its_recorded_collection_root() {
     dws()
         .current_dir(&collection)
         .env("DYNWS_HOME", &missing_home)
-        .args(["config", "editor", "clear"])
+        .args(["config", "clear", "editor"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -250,19 +250,19 @@ fn dynws_home_is_exact_and_uses_its_recorded_collection_root() {
 fn every_operational_entrypoint_is_guarded_and_side_effect_free() {
     let invocations: &[&[&str]] = &[
         &[],
-        &["--no-open"],
-        &["--editor", "missing-editor"],
+        &["new", "--no-open"],
+        &["new", "--editor", "missing-editor"],
         &["open", "missing"],
-        &["manage"],
-        &["manage", "edit", "missing", "--name", "new"],
-        &["manage", "remove", "missing"],
-        &["manage", "reveal", "missing"],
-        &["config", "editor", "list"],
-        &["config", "editor", "set", "missing-editor"],
-        &["config", "editor", "clear"],
-        &["config", "file-manager", "list"],
-        &["config", "file-manager", "set", "missing-manager"],
-        &["config", "file-manager", "clear"],
+        &["new"],
+        &["edit", "missing", "--name", "new"],
+        &["remove", "missing"],
+        &["reveal", "missing"],
+        &["config", "list", "file-manager"],
+        &["config", "set", "editor", "missing-editor"],
+        &["config", "clear", "editor"],
+        &["config", "list", "file-manager"],
+        &["config", "set", "file-manager", "missing-manager"],
+        &["config", "clear", "file-manager"],
     ];
 
     for args in invocations {
@@ -301,7 +301,7 @@ fn initialized_config_commands_persist_without_changing_the_layout() {
         .current_dir(temp.path())
         .env_remove("DYNWS_HOME")
         .env("PATH", &path)
-        .args(["config", "editor", "set", "fake-editor"])
+        .args(["config", "set", "editor", "fake-editor"])
         .assert()
         .success()
         .stdout(predicate::str::contains("default editor set"));
@@ -309,7 +309,7 @@ fn initialized_config_commands_persist_without_changing_the_layout() {
         .current_dir(temp.path())
         .env_remove("DYNWS_HOME")
         .env("PATH", &path)
-        .args(["config", "file-manager", "set", "fake-manager"])
+        .args(["config", "set", "file-manager", "fake-manager"])
         .assert()
         .success()
         .stdout(predicate::str::contains("default file manager set"));
@@ -324,7 +324,7 @@ fn initialized_config_commands_persist_without_changing_the_layout() {
 }
 
 #[test]
-fn retained_manage_edit_uses_one_combined_update() {
+fn edit_uses_one_combined_update() {
     let temp = tempfile::tempdir().unwrap();
     init(temp.path());
     let home = temp.path().join(".dynws");
@@ -344,7 +344,6 @@ updated_at = "2026-01-01T00:00:00Z"
         .current_dir(temp.path())
         .env_remove("DYNWS_HOME")
         .args([
-            "manage",
             "edit",
             "demo",
             "--name",
@@ -377,7 +376,7 @@ fn help_and_version_work_without_initialization() {
         .stdout(predicate::str::contains("Usage: dws"))
         .stdout(predicate::str::contains("init"))
         .stdout(predicate::str::contains("open"))
-        .stdout(predicate::str::contains("manage"))
+        .stdout(predicate::str::contains("new"))
         .stdout(predicate::str::contains("config"))
         .stdout(predicate::str::contains("setup").not())
         .stdout(predicate::str::contains("zoxide").not());
@@ -418,7 +417,7 @@ fn ancestor_marker_must_belong_to_its_directory() {
     dws()
         .current_dir(temp.path())
         .env_remove("DYNWS_HOME")
-        .args(["config", "editor", "list"])
+        .args(["config", "list", "file-manager"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("records collection root"));
@@ -442,7 +441,7 @@ fn dangling_inner_marker_does_not_fall_through_to_an_outer_project() {
     dws()
         .current_dir(&nested)
         .env_remove("DYNWS_HOME")
-        .args(["config", "editor", "clear"])
+        .args(["config", "clear", "editor"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -455,6 +454,10 @@ fn removed_commands_and_shell_init_are_rejected_by_clap() {
     let temp = tempfile::tempdir().unwrap();
     for args in [
         vec!["setup"],
+        vec!["manage"],
+        vec!["config", "editor", "list"],
+        vec!["config", "list", "editor"],
+        vec!["--no-open"],
         vec!["list"],
         vec!["path", "demo"],
         vec!["zoxide", "sync"],
@@ -468,7 +471,8 @@ fn removed_commands_and_shell_init_are_rejected_by_clap() {
             .failure()
             .stderr(
                 predicate::str::contains("unexpected argument")
-                    .or(predicate::str::contains("unrecognized subcommand")),
+                    .or(predicate::str::contains("unrecognized subcommand"))
+                    .or(predicate::str::contains("invalid value")),
             );
     }
     assert!(!temp.path().join(".dynws").exists());
@@ -491,7 +495,7 @@ fn incomplete_or_unsupported_projects_fail_without_repairing() {
     dws()
         .current_dir(temp.path())
         .env_remove("DYNWS_HOME")
-        .args(["config", "editor", "list"])
+        .args(["config", "list", "file-manager"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -501,4 +505,154 @@ fn incomplete_or_unsupported_projects_fail_without_repairing() {
     assert!(!home.join("sessions").exists());
     assert!(!home.join("workspaces").exists());
     assert!(!home.join("worktrees").exists());
+}
+
+#[test]
+fn interactive_entrypoints_reject_pipes_and_conflicts_before_terminal_setup() {
+    let temp = tempfile::tempdir().unwrap();
+    init(temp.path());
+    for args in [vec![], vec!["new"], vec!["new", "--no-open"]] {
+        dws()
+            .current_dir(temp.path())
+            .env_remove("DYNWS_HOME")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("require a terminal"));
+    }
+    for args in [
+        vec!["new", "--editor", "sh", "--no-open"],
+        vec!["edit", "demo", "--description", "x", "--clear-description"],
+        vec!["--editor", "sh", "open", "demo"],
+    ] {
+        dws()
+            .current_dir(temp.path())
+            .env_remove("DYNWS_HOME")
+            .args(args)
+            .assert()
+            .code(2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn editor_is_waited_for_preserves_quoted_arguments_and_reports_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    init(temp.path());
+    let home = temp.path().join(".dynws");
+    fs::create_dir(home.join("workspaces/demo")).unwrap();
+    fs::write(
+        home.join("sessions/demo.toml"),
+        "name='demo'\nrepos=[]\ncreated_at='now'\nupdated_at='now'\n",
+    )
+    .unwrap();
+    let marker = temp.path().join("finished");
+    let script = temp.path().join("editor with spaces");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nsleep 0.05\nprintf done > '{}'\n",
+            temp.path().join("args").display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = format!("\"{}\" \"two words\" '$(literal)'", script.display());
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .args(["open", "demo", "--editor", &command])
+        .assert()
+        .success();
+    assert_eq!(fs::read_to_string(marker).unwrap(), "done");
+    let args = fs::read_to_string(temp.path().join("args")).unwrap();
+    assert!(args.starts_with("two words\n$(literal)\n"));
+    assert!(args.ends_with(
+        &format!("{}\n", home.join("workspaces/demo").canonicalize().unwrap().display())
+    ));
+    fs::write(&script, "#!/bin/sh\nexit 7\n").unwrap();
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .args(["open", "demo", "--editor", &command])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("editor exited"));
+    assert!(home.join("sessions/demo.toml").is_file());
+}
+
+#[test]
+fn live_completion_is_scoped_fresh_quiet_and_never_runs_git_or_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    init(temp.path());
+    let home = temp.path().join(".dynws");
+    let nested = temp.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    #[cfg(unix)]
+    {
+        fs::write(
+            bin.join("git"),
+            "#!/bin/sh\necho 'completion must not invoke git' >&2\nexit 99\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let write = |name: &str| {
+        fs::write(home.join("sessions").join(format!("{name}.toml")), format!(
+        "name='{name}'\ncreated_at='now'\nupdated_at='now'\n[[repos]]\nname='api'\npath='/missing-worktree'\nkind='worktree'\nsource_repo='/missing-source'\nlocal_branch='main'\n"
+    )).unwrap()
+    };
+    write("api-review");
+    fs::write(home.join("sessions/bad.toml"), "bad").unwrap();
+    let complete = |cwd: &std::path::Path, explicit: Option<&std::path::Path>| {
+        let mut cmd = dws();
+        cmd.current_dir(cwd)
+            .env("DWS_COMPLETE", "zsh")
+            .env("_CLAP_COMPLETE_INDEX", "2")
+            .env("_CLAP_IFS", "\n")
+            .env("PATH", &bin);
+        if let Some(home) = explicit {
+            cmd.env("DYNWS_HOME", home);
+        } else {
+            cmd.env_remove("DYNWS_HOME");
+        }
+        cmd.args(["--", "dws", "open", "api-"])
+            .assert()
+            .success()
+            .stderr("")
+            .get_output()
+            .stdout
+            .clone()
+    };
+    assert!(
+        String::from_utf8(complete(&nested, None))
+            .unwrap()
+            .contains("api-review")
+    );
+    assert!(!home.join("create.lock").exists());
+    fs::remove_file(home.join("sessions/api-review.toml")).unwrap();
+    write("api-renamed");
+    let output = String::from_utf8(complete(&nested, None)).unwrap();
+    assert!(output.contains("api-renamed") && !output.contains("api-review"));
+    let other = tempfile::tempdir().unwrap();
+    init(other.path());
+    assert!(complete(other.path(), None).is_empty());
+    assert!(
+        String::from_utf8(complete(other.path(), Some(&home)))
+            .unwrap()
+            .contains("api-renamed")
+    );
+    let absent = tempfile::tempdir().unwrap();
+    assert!(complete(absent.path(), None).is_empty());
+    assert!(!absent.path().join(".dynws").exists());
+    assert!(!home.join("create.lock").exists());
+    dws()
+        .current_dir(temp.path())
+        .env_remove("DYNWS_HOME")
+        .args(["open", "api-renamed", "--editor", "sh"])
+        .assert()
+        .failure();
 }

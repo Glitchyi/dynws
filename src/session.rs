@@ -11,6 +11,8 @@ use crate::git;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<crate::manifest::CreationRecord>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -103,6 +105,18 @@ pub struct RepoRemovalOutcome {
     pub warning: Option<String>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct RemovalFault {
+    stage: Option<usize>,
+    cleanup: bool,
+}
+
+#[derive(Debug)]
+pub struct RemovalOutcome {
+    pub sessions: Vec<SessionMetadata>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoAdditionOutcome {
     pub session: SessionMetadata,
@@ -140,11 +154,48 @@ impl CreateOutcome {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     paths: DynwsPaths,
+    lock: Option<std::sync::Arc<crate::config::MutationLock>>,
+    #[cfg(test)]
+    fail_metadata_writes: bool,
 }
 
 impl SessionStore {
     pub fn new(paths: DynwsPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            lock: None,
+            #[cfg(test)]
+            fail_metadata_writes: false,
+        }
+    }
+
+    pub fn locked(&self) -> Result<Self> {
+        if self.lock.is_some() {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            paths: self.paths.clone(),
+            lock: Some(std::sync::Arc::new(self.paths.mutation_lock()?)),
+            #[cfg(test)]
+            fail_metadata_writes: self.fail_metadata_writes,
+        })
+    }
+
+    pub fn checked<T>(
+        &self,
+        expected: &[SessionMetadata],
+        operation: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        let store = self.locked()?;
+        for previous in expected {
+            if store.load_session(&previous.name)? != *previous {
+                bail!(
+                    "session '{}' changed elsewhere; refresh and retry",
+                    previous.name
+                );
+            }
+        }
+        operation(&store)
     }
 
     pub fn paths(&self) -> &DynwsPaths {
@@ -206,6 +257,9 @@ impl SessionStore {
     }
 
     pub fn edit_session(&self, name: &str, patch: SessionPatch) -> Result<SessionMetadata> {
+        if self.lock.is_none() {
+            return self.locked()?.edit_session(name, patch);
+        }
         let old_name = normalize_name(name)?;
         let new_name = patch
             .name
@@ -250,9 +304,7 @@ impl SessionStore {
         fs::rename(&old_file, &backup_file)
             .with_context(|| format!("failed to stage {}", old_file.display()))?;
         let workspace_moved = fs::symlink_metadata(&old_workspace).is_ok();
-        if workspace_moved
-            && let Err(error) = fs::rename(&old_workspace, &new_workspace)
-        {
+        if workspace_moved && let Err(error) = fs::rename(&old_workspace, &new_workspace) {
             let _ = fs::rename(&backup_file, &old_file);
             return Err(error).with_context(|| {
                 format!(
@@ -274,40 +326,102 @@ impl SessionStore {
         Ok(metadata)
     }
 
+    #[cfg(test)]
     pub fn remove_session(&self, name: &str) -> Result<SessionMetadata> {
-        let normalized = normalize_name(name)?;
-        let metadata = self.load_session(&normalized)?;
-        let workspace = self.workspace_path(&normalized);
-        let file = self.session_file(&normalized);
-        validate_workspace(&workspace, &metadata)?;
+        Ok(self.remove_sessions(&[name.to_owned()])?.sessions.remove(0))
+    }
 
-        let nonce = format!("{}.{}", std::process::id(), Utc::now().timestamp_micros());
-        let staged_file = self
-            .paths
-            .sessions_dir
-            .join(format!(".{normalized}.{nonce}.remove"));
-        let staged_workspace = self
-            .paths
-            .workspaces_dir
-            .join(format!(".{normalized}.{nonce}.remove"));
-        fs::rename(&file, &staged_file)
-            .with_context(|| format!("failed to stage {}", file.display()))?;
+    pub fn remove_sessions(&self, names: &[String]) -> Result<RemovalOutcome> {
+        self.remove_sessions_staged(names, RemovalFault::default())
+    }
 
-        let workspace_exists = fs::symlink_metadata(&workspace).is_ok();
-        if workspace_exists && let Err(error) = fs::rename(&workspace, &staged_workspace) {
-            let _ = fs::rename(&staged_file, &file);
-            return Err(error)
-                .with_context(|| format!("failed to stage {}", workspace.display()));
+    fn remove_sessions_staged(
+        &self,
+        names: &[String],
+        fault: RemovalFault,
+    ) -> Result<RemovalOutcome> {
+        if self.lock.is_none() {
+            return self.locked()?.remove_sessions_staged(names, fault);
         }
-
-        if workspace_exists && let Err(error) = fs::remove_dir_all(&staged_workspace) {
-            let _ = fs::rename(&staged_workspace, &workspace);
-            let _ = fs::rename(&staged_file, &file);
-            return Err(error)
-                .with_context(|| format!("failed to remove {}", staged_workspace.display()));
+        let mut unique = HashSet::new();
+        let sessions = names
+            .iter()
+            .map(|name| {
+                let metadata = self.load_session(name)?;
+                if !unique.insert(metadata.name.clone()) {
+                    bail!("duplicate removal target '{}'", metadata.name);
+                }
+                validate_workspace(&self.workspace_path(&metadata.name), &metadata)?;
+                Ok(metadata)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let nonce = format!(
+            "{}.{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let mut staged: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+        let stage_result = (|| -> Result<()> {
+            for metadata in &sessions {
+                let file = self.session_file(&metadata.name);
+                let target = file.with_file_name(format!(".{}.{nonce}.remove", metadata.name));
+                fs::rename(&file, &target)?;
+                staged.push((file, target, false));
+                if fault.stage == Some(staged.len()) {
+                    bail!("injected staging failure");
+                }
+                let workspace = self.workspace_path(&metadata.name);
+                if fs::symlink_metadata(&workspace).is_ok() {
+                    let target =
+                        workspace.with_file_name(format!(".{}.{nonce}.remove", metadata.name));
+                    fs::rename(&workspace, &target)?;
+                    staged.push((workspace, target.clone(), true));
+                    validate_workspace(&target, metadata)?;
+                    if fault.stage == Some(staged.len()) {
+                        bail!("injected staging failure");
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = stage_result {
+            let mut failures = Vec::new();
+            for (original, target, _) in staged.iter().rev() {
+                if let Err(restore) = fs::rename(target, original) {
+                    failures.push(format!(
+                        "{} -> {}: {restore}",
+                        target.display(),
+                        original.display()
+                    ));
+                }
+            }
+            if !failures.is_empty() {
+                bail!(
+                    "{error:#}; rollback retained staged paths: {}",
+                    failures.join("; ")
+                );
+            }
+            return Err(error).context("session removal was rolled back");
         }
-        let _ = fs::remove_file(&staged_file);
-        Ok(metadata)
+        // All logical targets are now removed. Cleanup cannot undo that commit;
+        // retain and report any staged data that the OS refuses to remove.
+        let mut warnings = Vec::new();
+        for (_, target, directory) in staged {
+            let result = if fault.cleanup {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else if directory {
+                fs::remove_dir_all(&target)
+            } else {
+                fs::remove_file(&target)
+            };
+            if let Err(error) = result {
+                warnings.push(format!(
+                    "session removed; cleanup retained {}: {error}",
+                    target.display()
+                ));
+            }
+        }
+        Ok(RemovalOutcome { sessions, warnings })
     }
 
     pub fn remove_repo_link(
@@ -315,6 +429,9 @@ impl SessionStore {
         session_name: &str,
         repo_name: &str,
     ) -> Result<RepoRemovalOutcome> {
+        if self.lock.is_none() {
+            return self.locked()?.remove_repo_link(session_name, repo_name);
+        }
         validate_link_name(repo_name)?;
         let normalized = normalize_name(session_name)?;
         let mut metadata = self.load_session(&normalized)?;
@@ -415,6 +532,9 @@ impl SessionStore {
         session_name: &str,
         repos: &[RepoSelection],
     ) -> Result<RepoAdditionOutcome> {
+        if self.lock.is_none() {
+            return self.locked()?.add_repo_links(session_name, repos);
+        }
         let normalized = normalize_name(session_name)?;
         let mut metadata = self.load_session(&normalized)?;
         let canonical_repos = canonical_selection_set(repos, &self.paths)?;
@@ -548,6 +668,14 @@ impl SessionStore {
         description: Option<String>,
         allow_duplicate: bool,
     ) -> Result<CreateOutcome> {
+        if self.lock.is_none() {
+            return self.locked()?.create_session_with_links(
+                requested_name,
+                repos,
+                description,
+                allow_duplicate,
+            );
+        }
         let canonical_repos = canonical_selection_set(repos, &self.paths)?;
         let repo_paths = canonical_repos
             .iter()
@@ -607,6 +735,7 @@ impl SessionStore {
 
         let timestamp = Utc::now().to_rfc3339();
         let metadata = SessionMetadata {
+            creation: None,
             name,
             description,
             repos: repo_links,
@@ -628,6 +757,10 @@ impl SessionStore {
     }
 
     fn write_session_metadata(&self, metadata: &SessionMetadata) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_metadata_writes {
+            bail!("injected metadata write failure");
+        }
         let name = normalize_name(&metadata.name)?;
         validate_session_metadata(metadata, &name, &self.paths)?;
         let session_file = self.session_file(&name);
@@ -723,13 +856,18 @@ fn selections_from_paths(repos: &[PathBuf]) -> Result<Vec<RepoSelection>> {
         .collect()
 }
 
-fn validate_link_name(name: &str) -> Result<()> {
+pub(crate) fn validate_link_name(name: &str) -> Result<()> {
     let path = Path::new(name);
     let is_single_component = matches!(
         path.components().collect::<Vec<_>>().as_slice(),
         [Component::Normal(_)]
     );
-    if name.trim().is_empty() || name != name.trim() || !is_single_component {
+    if name.trim().is_empty()
+        || name != name.trim()
+        || !is_single_component
+        || name.contains('/')
+        || name.contains('\0')
+    {
         bail!("repo link name is not safe to use as a path component: {name}");
     }
     Ok(())
@@ -794,9 +932,7 @@ fn validate_session_metadata(
                 if !Path::new(source_repo).is_absolute() {
                     bail!("managed worktree source must be absolute: {source_repo}");
                 }
-                if repo.remote_ref.as_deref().is_none_or(str::is_empty)
-                    || repo.local_branch.as_deref().is_none_or(str::is_empty)
-                {
+                if repo.local_branch.as_deref().is_none_or(str::is_empty) {
                     bail!(
                         "managed worktree '{}' is missing branch metadata",
                         repo.name
@@ -865,7 +1001,10 @@ fn canonical_repo_set(repos: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(canonical)
 }
 
-fn canonical_selection_set(repos: &[RepoSelection], paths: &DynwsPaths) -> Result<Vec<RepoSelection>> {
+fn canonical_selection_set(
+    repos: &[RepoSelection],
+    paths: &DynwsPaths,
+) -> Result<Vec<RepoSelection>> {
     if repos.is_empty() {
         bail!("at least one repo must be selected");
     }
@@ -919,7 +1058,10 @@ fn canonical_selection_set(repos: &[RepoSelection], paths: &DynwsPaths) -> Resul
                     .context("worktree selection is missing local branch")?
                     .clone();
                 if !path_is_within(&path, &paths.worktrees_dir) {
-                    bail!("worktree selection is outside dws storage: {}", path.display());
+                    bail!(
+                        "worktree selection is outside dws storage: {}",
+                        path.display()
+                    );
                 }
                 let info = git::inspect_worktree(&path)?
                     .with_context(|| format!("{} is not a linked git worktree", path.display()))?;
@@ -1034,6 +1176,91 @@ fn create_symlink(_target: &Path, _link: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bulk_removal_preflights_every_target_and_rolls_back_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let store =
+            super::SessionStore::new(crate::config::DynwsPaths::from_home(root.join(".dynws")));
+        for name in ["one", "two"] {
+            store
+                .create_session(name, std::slice::from_ref(&repo), None, true)
+                .unwrap();
+        }
+        let names = vec!["one".to_string(), "two".to_string()];
+        std::fs::write(store.workspace_path("two").join("unexpected"), "keep").unwrap();
+        assert!(store.remove_sessions(&names).is_err());
+        assert!(store.load_session("one").is_ok());
+        assert!(store.workspace_path("one").join("repo").exists());
+        std::fs::remove_file(store.workspace_path("two").join("unexpected")).unwrap();
+        for after in 1..=4 {
+            assert!(
+                store
+                    .remove_sessions_staged(
+                        &names,
+                        super::RemovalFault {
+                            stage: Some(after),
+                            cleanup: false
+                        }
+                    )
+                    .is_err()
+            );
+            for name in &names {
+                assert!(store.load_session(name).is_ok());
+                assert!(store.workspace_path(name).join("repo").exists());
+            }
+        }
+        let result = store
+            .remove_sessions_staged(
+                &names,
+                super::RemovalFault {
+                    stage: None,
+                    cleanup: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.sessions.len(), 2);
+        assert_eq!(result.warnings.len(), 4);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|warning| warning.contains("cleanup retained"))
+        );
+        assert!(repo.is_dir());
+        for name in &names {
+            assert!(store.load_session(name).is_err());
+            assert!(!store.workspace_path(name).exists());
+        }
+    }
+
+    #[test]
+    fn mutations_share_one_lock_and_stale_metadata_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let store = super::SessionStore::new(crate::config::DynwsPaths::from_home(
+            temp.path().join(".dynws"),
+        ));
+        let old = store
+            .create_session("demo", &[repo], None, false)
+            .unwrap()
+            .into_metadata();
+        {
+            let locked = store.locked().unwrap();
+            assert!(store.locked().is_err());
+            locked.rename_session("demo", "ready").unwrap();
+        }
+        assert!(
+            store
+                .checked(&[old], |locked| locked.remove_sessions(&["ready".into()]))
+                .is_err()
+        );
+        assert!(store.load_session("ready").is_ok());
+    }
+
     use super::*;
     use std::process::Command;
 
@@ -1344,7 +1571,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("already exists"));
+        assert!(error.to_string().contains("already exists"), "{error:#}");
         assert!(!home.join("workspaces/demo/beta").exists());
         assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);
         assert!(store.add_repo_links("demo", &[]).is_err());
@@ -1361,25 +1588,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rolls_back_added_links_when_metadata_cannot_be_persisted() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let alpha = make_repo(&temp.path().join("repos"), "alpha");
         let beta = make_repo(&temp.path().join("repos"), "beta");
-        let store = SessionStore::new(DynwsPaths::from_home(&home));
+        let mut store = SessionStore::new(DynwsPaths::from_home(&home));
         store
             .create_session("demo", std::slice::from_ref(&alpha), None, false)
             .unwrap();
-        let sessions_dir = home.join("sessions");
-        let original_permissions = fs::metadata(&sessions_dir).unwrap().permissions();
-        let mut read_only = original_permissions.clone();
-        read_only.set_mode(0o555);
-        fs::set_permissions(&sessions_dir, read_only).unwrap();
+        store.fail_metadata_writes = true;
 
         let result = store.add_repo_links("demo", &[RepoSelection::link("beta", beta)]);
 
-        fs::set_permissions(&sessions_dir, original_permissions).unwrap();
         assert!(result.is_err());
         assert!(!home.join("workspaces/demo/beta").exists());
         assert_eq!(store.load_session("demo").unwrap().repos.len(), 1);

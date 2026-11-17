@@ -132,8 +132,7 @@ pub fn fetch_origin(repo_path: &Path) -> Result<()> {
     bail!("git fetch origin failed: {prune_error}");
 }
 
-#[cfg(test)]
-fn is_ref_lock_fetch_error(message: &str) -> bool {
+pub fn is_ref_lock_fetch_error(message: &str) -> bool {
     let message = message.to_lowercase();
     message.contains("could not delete references")
         || message.contains("cannot lock ref")
@@ -616,15 +615,36 @@ fn source_repository(repo_path: &Path) -> Result<PathBuf> {
 }
 
 fn worktree_records(repo_path: &Path) -> Result<Vec<WorktreeRecord>> {
-    let output = git_command_output(repo_path, ["worktree", "list", "--porcelain"])?;
+    let output = git_command_output(repo_path, ["worktree", "list", "--porcelain", "-z"])?;
     if !output.status.success() {
         bail!("git worktree list failed: {}", combined_git_error(&output));
     }
-    Ok(parse_worktree_records(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    parse_worktree_records_nul(&output.stdout)
 }
 
+fn parse_worktree_records_nul(output: &[u8]) -> Result<Vec<WorktreeRecord>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut records = Vec::new();
+    let mut path = None;
+    let mut local_branch = None;
+    for field in output.split(|b| *b == 0) {
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            path = Some(PathBuf::from(OsStr::from_bytes(value)));
+        } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
+            local_branch = Some(std::str::from_utf8(value)?.to_owned());
+        } else if field.is_empty()
+            && let Some(path) = path.take()
+        {
+            records.push(WorktreeRecord {
+                path,
+                local_branch: local_branch.take(),
+            });
+        }
+    }
+    Ok(records)
+}
+
+#[cfg(test)]
 fn parse_worktree_records(output: &str) -> Vec<WorktreeRecord> {
     output
         .split("\n\n")
@@ -1217,4 +1237,236 @@ origin/main
         assert!(error.to_string().contains("symlinked worktree target"));
         assert!(actual.path.exists());
     }
+}
+
+/// A fully resolved strict request; never uses the interactive fallback branch policy.
+#[derive(Debug, Clone)]
+pub struct StrictBranch {
+    pub local: String,
+    pub remote: Option<String>,
+    pub start: String,
+    pub create: bool,
+}
+
+pub fn strict_output(path: &Path, args: &[&OsStr]) -> Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/usr/bin/false")
+        .env("SSH_ASKPASS", "/usr/bin/false")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes",
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("failed to run noninteractive git")
+}
+
+pub fn strict_git(path: &Path, args: &[&str]) -> Result<String> {
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    let output = strict_output(path, &args)?;
+    if !output.status.success() {
+        bail!(
+            "git failed in {}: {}",
+            path.display(),
+            combined_git_error(&output)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("Git returned non-UTF-8 data")?
+        .trim_end()
+        .to_owned())
+}
+
+pub fn strict_source(path: &Path) -> Result<PathBuf> {
+    if strict_git(path, &["rev-parse", "--is-bare-repository"])? != "false" {
+        bail!("bare repositories are not supported");
+    }
+    let output = strict_output(
+        path,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("list"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+        ],
+    )?;
+    if !output.status.success() {
+        bail!(
+            "cannot inspect source repository: {}",
+            combined_git_error(&output)
+        );
+    }
+    let first = output
+        .stdout
+        .split(|b| *b == 0)
+        .next()
+        .context("empty worktree list")?;
+    let bytes = first
+        .strip_prefix(b"worktree ")
+        .context("invalid Git worktree list")?;
+    #[cfg(unix)]
+    let source = {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(OsStr::from_bytes(bytes))
+    };
+    #[cfg(not(unix))]
+    let source = PathBuf::from(std::str::from_utf8(bytes)?);
+    source
+        .canonicalize()
+        .context("cannot resolve source repository")
+}
+
+fn strict_ref_exists(path: &Path, reference: &str) -> Result<bool> {
+    let output = strict_output(
+        path,
+        &[
+            OsStr::new("show-ref"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::new(reference),
+        ],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "cannot inspect ref {reference}: {}",
+            combined_git_error(&output)
+        ),
+    }
+}
+
+pub fn strict_branch(path: &Path, expression: &str) -> Result<StrictBranch> {
+    let local = expression.strip_prefix("refs/heads/").unwrap_or(expression);
+    if !expression.starts_with("refs/remotes/")
+        && strict_ref_exists(path, &format!("refs/heads/{local}"))?
+    {
+        validate_branch(path, local)?;
+        return Ok(StrictBranch {
+            local: local.to_owned(),
+            remote: None,
+            start: format!("refs/heads/{local}"),
+            create: false,
+        });
+    }
+    let remote = expression
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(expression);
+    if expression.starts_with("refs/heads/")
+        || !strict_ref_exists(path, &format!("refs/remotes/{remote}"))?
+    {
+        bail!(
+            "branch '{expression}' does not exist locally; specify an existing local or remote-tracking branch"
+        );
+    }
+    let (_, local) = remote
+        .split_once('/')
+        .context("remote ref needs a remote and branch")?;
+    validate_branch(path, local)?;
+    let create = !strict_ref_exists(path, &format!("refs/heads/{local}"))?;
+    if !create {
+        let upstream = strict_git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(upstream)",
+                &format!("refs/heads/{local}"),
+            ],
+        )?;
+        if upstream != format!("refs/remotes/{remote}") {
+            bail!("local branch '{local}' must track exactly '{remote}'");
+        }
+    }
+    Ok(StrictBranch {
+        local: local.to_owned(),
+        remote: Some(remote.to_owned()),
+        start: format!("refs/remotes/{remote}"),
+        create,
+    })
+}
+
+pub fn validate_branch(path: &Path, branch: &str) -> Result<()> {
+    // --branch expands @{-N}; disallow that shorthand and option-like names explicitly.
+    if branch.is_empty() || branch.starts_with('-') || branch.contains("@{") {
+        bail!("invalid branch name '{branch}'");
+    }
+    strict_git(path, &["check-ref-format", "--branch", branch])?;
+    Ok(())
+}
+
+pub fn strict_new_branch(path: &Path, branch: &str, base: &str) -> Result<StrictBranch> {
+    validate_branch(path, branch)?;
+    if strict_ref_exists(path, &format!("refs/heads/{branch}"))? {
+        bail!("new branch '{branch}' already exists; explicitly select it with branch instead");
+    }
+    let commit = strict_git(
+        path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base}^{{commit}}"),
+        ],
+    )?;
+    Ok(StrictBranch {
+        local: branch.to_owned(),
+        remote: None,
+        start: commit,
+        create: true,
+    })
+}
+
+pub fn strict_available(path: &Path, branch: &str) -> Result<()> {
+    let output = strict_output(
+        path,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("list"),
+            OsStr::new("--porcelain"),
+            OsStr::new("-z"),
+        ],
+    )?;
+    if !output.status.success() {
+        bail!(
+            "cannot inspect worktree occupancy: {}",
+            combined_git_error(&output)
+        );
+    }
+    let field = format!("branch refs/heads/{branch}");
+    if output
+        .stdout
+        .split(|b| *b == 0)
+        .any(|value| value == field.as_bytes())
+    {
+        bail!("branch '{branch}' is already checked out in another worktree");
+    }
+    Ok(())
+}
+
+pub fn strict_add(path: &Path, target: &Path, branch: &StrictBranch) -> Result<()> {
+    let mut args = vec![OsStr::new("worktree"), OsStr::new("add")];
+    if branch.create {
+        args.extend([OsStr::new("-b"), OsStr::new(&branch.local)]);
+        if branch.remote.is_none() {
+            args.push(OsStr::new("--no-track"));
+        } else {
+            args.push(OsStr::new("--track"));
+        }
+    }
+    args.push(OsStr::new("--"));
+    args.push(target.as_os_str());
+    args.push(OsStr::new(if branch.create {
+        &branch.start
+    } else {
+        &branch.local
+    }));
+    let output = strict_output(path, &args)?;
+    if !output.status.success() {
+        bail!("worktree creation failed: {}", combined_git_error(&output));
+    }
+    Ok(())
 }

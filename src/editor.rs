@@ -5,14 +5,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Editor {
+pub struct LaunchCommand {
     pub id: String,
     pub label: String,
     pub command: String,
     pub args: Vec<String>,
 }
 
-impl Editor {
+impl LaunchCommand {
     pub fn command_line(&self) -> String {
         command_line(
             &self.command,
@@ -21,58 +21,12 @@ impl Editor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileManager {
-    pub id: String,
-    pub label: String,
-    pub command: String,
-    pub args: Vec<String>,
-}
-
-impl FileManager {
-    pub fn command_line(&self) -> String {
-        std::iter::once(self.command.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-struct KnownEditor {
-    id: &'static str,
-    label: &'static str,
-    commands: &'static [&'static str],
-}
-
 struct KnownFileManager {
     id: &'static str,
     label: &'static str,
     command: &'static str,
     args: &'static [&'static str],
 }
-
-const KNOWN_EDITORS: &[KnownEditor] = &[
-    KnownEditor {
-        id: "code",
-        label: "VS Code",
-        commands: &["code", "code-insiders"],
-    },
-    KnownEditor {
-        id: "cursor",
-        label: "Cursor",
-        commands: &["cursor"],
-    },
-    KnownEditor {
-        id: "antigravity",
-        label: "Antigravity",
-        commands: &["antigravity"],
-    },
-    KnownEditor {
-        id: "bob",
-        label: "IBM Bob",
-        commands: &["bobide"],
-    },
-];
 
 const KNOWN_FILE_MANAGERS: &[KnownFileManager] = &[
     KnownFileManager {
@@ -113,33 +67,13 @@ const KNOWN_FILE_MANAGERS: &[KnownFileManager] = &[
     },
 ];
 
-pub fn detect_editors() -> Vec<Editor> {
-    let mut editors = Vec::new();
-    let mut seen = HashSet::new();
-
-    for known in KNOWN_EDITORS {
-        for command in known.commands {
-            if command_exists(command) && seen.insert((*command).to_string()) {
-                editors.push(Editor {
-                    id: known.id.to_string(),
-                    label: known.label.to_string(),
-                    command: (*command).to_string(),
-                    args: Vec::new(),
-                });
-            }
-        }
-    }
-
-    editors
-}
-
-pub fn detect_file_managers() -> Vec<FileManager> {
+pub fn detect_file_managers() -> Vec<LaunchCommand> {
     let mut managers = Vec::new();
     let mut seen = HashSet::new();
 
     for known in KNOWN_FILE_MANAGERS {
         if command_exists(known.command) && seen.insert(command_line(known.command, known.args)) {
-            managers.push(FileManager {
+            managers.push(LaunchCommand {
                 id: known.id.to_string(),
                 label: known.label.to_string(),
                 command: known.command.to_string(),
@@ -151,46 +85,18 @@ pub fn detect_file_managers() -> Vec<FileManager> {
     managers
 }
 
-pub fn resolve_editor(
-    explicit: Option<&str>,
-    default: Option<&str>,
-    detected: &[Editor],
-) -> Result<Editor> {
-    if let Some(requested) = explicit
+pub fn resolve_editor(explicit: Option<&str>, default: Option<&str>) -> Result<LaunchCommand> {
+    let requested = explicit
         .or(default)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(editor) = find_editor(requested, detected) {
-            return Ok(editor.clone());
-        }
-        return editor_from_command_line(requested)
-            .with_context(|| format!("failed to resolve editor command '{requested}'"));
-    }
-
-    match detected {
-        [single] => Ok(single.clone()),
-        [] => {
-            bail!("no supported editor commands detected; run `dws config editor set <command>`")
-        }
-        many => {
-            let names = many
-                .iter()
-                .map(|editor| editor.command.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "multiple editors detected ({names}); choose one with --editor or `dws config editor set`"
-            )
-        }
-    }
+        .context("no editor configured; use --editor or 'dws config set editor <command>'")?;
+    from_command_line(requested).context("failed to resolve editor command")
 }
 
 pub fn resolve_file_manager(
     explicit: Option<&str>,
     default: Option<&str>,
-    detected: &[FileManager],
-) -> Result<FileManager> {
+    detected: &[LaunchCommand],
+) -> Result<LaunchCommand> {
     if let Some(requested) = explicit
         .or(default)
         .map(str::trim)
@@ -199,12 +105,12 @@ pub fn resolve_file_manager(
         if let Some(manager) = find_file_manager(requested, detected) {
             return Ok(manager.clone());
         }
-        return file_manager_from_command_line(requested)
+        return from_command_line(requested)
             .with_context(|| format!("failed to resolve file manager command '{requested}'"));
     }
 
     for command_line in default_file_manager_command_lines() {
-        if let Ok(manager) = file_manager_from_command_line(command_line) {
+        if let Ok(manager) = from_command_line(command_line) {
             return Ok(manager);
         }
     }
@@ -213,39 +119,31 @@ pub fn resolve_file_manager(
         [single] => Ok(single.clone()),
         [] => {
             bail!(
-                "no supported file manager command detected; run `dws config file-manager set <command>`"
+                "no supported file manager command detected; run `dws config set file-manager <command>`"
             )
         }
         many => Ok(many[0].clone()),
     }
 }
 
-pub fn open_editor(editor: &Editor, path: &Path) -> Result<()> {
-    Command::new(&editor.command)
-        .args(&editor.args)
-        .arg(path)
-        .spawn()?;
+pub fn launch(command: &LaunchCommand, path: &Path, wait: bool) -> Result<()> {
+    let mut process = Command::new(&command.command);
+    process.args(&command.args).arg(path);
+    if wait {
+        let status = process.status().context("failed to launch editor")?;
+        if !status.success() {
+            bail!("editor exited with {status}");
+        }
+    } else {
+        process.spawn().context("failed to launch file manager")?;
+    }
     Ok(())
 }
 
-pub fn open_file_manager(file_manager: &FileManager, path: &Path) -> Result<()> {
-    Command::new(&file_manager.command)
-        .args(&file_manager.args)
-        .arg(path)
-        .spawn()?;
-    Ok(())
-}
-
-fn find_editor<'a>(requested: &str, detected: &'a [Editor]) -> Option<&'a Editor> {
-    detected.iter().find(|editor| {
-        editor.id.eq_ignore_ascii_case(requested)
-            || editor.command.eq_ignore_ascii_case(requested)
-            || editor.command_line().eq_ignore_ascii_case(requested)
-            || editor.label.eq_ignore_ascii_case(requested)
-    })
-}
-
-fn find_file_manager<'a>(requested: &str, detected: &'a [FileManager]) -> Option<&'a FileManager> {
+fn find_file_manager<'a>(
+    requested: &str,
+    detected: &'a [LaunchCommand],
+) -> Option<&'a LaunchCommand> {
     detected.iter().find(|manager| {
         manager.id.eq_ignore_ascii_case(requested)
             || manager.command.eq_ignore_ascii_case(requested)
@@ -254,33 +152,16 @@ fn find_file_manager<'a>(requested: &str, detected: &'a [FileManager]) -> Option
     })
 }
 
-fn editor_from_command_line(command_line: &str) -> Result<Editor> {
+fn from_command_line(command_line: &str) -> Result<LaunchCommand> {
     let parts = parse_command_line(command_line)?;
     let (command, args) = parts
         .split_first()
         .expect("parse_command_line returns at least one token");
     if !command_exists(command) {
-        bail!("editor command was not found: {command}");
+        bail!("launch command was not found: {command}");
     }
 
-    Ok(Editor {
-        id: command_line.to_string(),
-        label: command_line.to_string(),
-        command: (*command).to_string(),
-        args: args.iter().map(|arg| (*arg).to_string()).collect(),
-    })
-}
-
-fn file_manager_from_command_line(command_line: &str) -> Result<FileManager> {
-    let parts = parse_command_line(command_line)?;
-    let (command, args) = parts
-        .split_first()
-        .expect("parse_command_line returns at least one token");
-    if !command_exists(command) {
-        bail!("file manager command was not found: {command}");
-    }
-
-    Ok(FileManager {
+    Ok(LaunchCommand {
         id: command_line.to_string(),
         label: command_line.to_string(),
         command: (*command).to_string(),
@@ -430,32 +311,15 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn editors() -> Vec<Editor> {
+    fn file_managers() -> Vec<LaunchCommand> {
         vec![
-            Editor {
-                id: "code".to_string(),
-                label: "VS Code".to_string(),
-                command: "code".to_string(),
-                args: Vec::new(),
-            },
-            Editor {
-                id: "cursor".to_string(),
-                label: "Cursor".to_string(),
-                command: "cursor".to_string(),
-                args: Vec::new(),
-            },
-        ]
-    }
-
-    fn file_managers() -> Vec<FileManager> {
-        vec![
-            FileManager {
+            LaunchCommand {
                 id: "finder".to_string(),
                 label: "Finder".to_string(),
                 command: "open".to_string(),
                 args: Vec::new(),
             },
-            FileManager {
+            LaunchCommand {
                 id: "gio".to_string(),
                 label: "GNOME file manager".to_string(),
                 command: "gio".to_string(),
@@ -465,17 +329,20 @@ mod tests {
     }
 
     #[test]
-    fn explicit_editor_wins_over_default() {
-        let selected = resolve_editor(Some("cursor"), Some("code"), &editors()).unwrap();
-
-        assert_eq!(selected.command, "cursor");
-    }
-
-    #[test]
-    fn default_editor_is_used_when_no_override_exists() {
-        let selected = resolve_editor(None, Some("code"), &editors()).unwrap();
-
-        assert_eq!(selected.command, "code");
+    fn explicit_editor_wins_and_no_catalog_is_required() {
+        assert_eq!(
+            resolve_editor(Some("sh -e"), Some("missing-editor"))
+                .unwrap()
+                .command_line(),
+            "sh -e"
+        );
+        assert_eq!(resolve_editor(None, Some("sh")).unwrap().command, "sh");
+        assert!(
+            resolve_editor(None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("no editor configured")
+        );
     }
 
     #[test]
@@ -501,18 +368,11 @@ mod tests {
 
     #[test]
     fn resolves_custom_editor_command_lines() {
-        let selected = resolve_editor(Some("sh -c"), None, &[]).unwrap();
+        let selected = resolve_editor(Some("sh -c"), None).unwrap();
 
         assert_eq!(selected.command, "sh");
         assert_eq!(selected.args, vec!["-c"]);
         assert_eq!(selected.command_line(), "sh -c");
-    }
-
-    #[test]
-    fn errors_when_multiple_editors_have_no_default() {
-        let error = resolve_editor(None, None, &editors()).unwrap_err();
-
-        assert!(error.to_string().contains("multiple editors"));
     }
 
     #[test]
@@ -535,9 +395,11 @@ mod tests {
     fn uses_platform_file_manager_when_unset() {
         let selected = resolve_file_manager(None, None, &file_managers()).unwrap();
 
-        assert_eq!(
-            selected.command_line(),
-            default_file_manager_command_lines()[0]
-        );
+        let expected = default_file_manager_command_lines()
+            .iter()
+            .find(|command| from_command_line(command).is_ok())
+            .map(|command| (*command).to_owned())
+            .unwrap_or_else(|| file_managers()[0].command_line());
+        assert_eq!(selected.command_line(), expected);
     }
 }
