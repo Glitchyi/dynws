@@ -48,3 +48,10 @@ integration tests. Completion evidence is recorded in the local
 `GATES.open-with.md` ledger: stable and Rust 1.88 tests, formatting including the
 `autolib = false` module tree, strict Clippy on both toolchains, and the real PTY
 verification script.
+
+Linux CI exposed a zsh startup prompt for insecure completion directories on
+the hosted runner. The shell fixture now audits a deliberately unsafe directory,
+uses `compinit -i` to exclude unsafe paths, asserts that exclusion, and waits for
+actual shell/hook readiness output before sending completion input. This changes
+only the disposable test shell. The full PTY script passes locally with that
+regression fixture; the subsequent CI run is the Linux verification source.

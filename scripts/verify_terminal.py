@@ -501,17 +501,31 @@ def shell_tests(root, env, shell):
     path = shutil.which(shell)
     assert path, f"{shell} is required"
     args = [path, "-f"] if shell == "zsh" else [path, "--noprofile", "--norc", "-i"]
+    env = dict(env)
+    if shell == "zsh":
+        unsafe = root / "unsafe-completions"
+        unsafe.mkdir()
+        unsafe.chmod(0o777)
+        env["DWS_TEST_UNSAFE_COMPLETIONS"] = str(unsafe)
     term = Terminal(args, root, env)
     try:
+        ready = "printf 'SHELL_%s\\n' READY"
         if shell == "zsh":
-            term.send("PS1='DWS_PROMPT> '; autoload -Uz compinit; compinit -d \"$HOME/zcompdump\"\r")
+            # Hosted runners can have insecure system completion directories.
+            # Audit a known unsafe fixture, then ignore unsafe paths rather than
+            # prompting (or trusting them with compinit -u).
+            term.send("PS1='DWS_PROMPT> '; fpath=(\"$DWS_TEST_UNSAFE_COMPLETIONS\" $fpath); "
+                      "autoload -Uz compaudit compinit; dws_insecure_dirs=($(compaudit 2>/dev/null)); "
+                      "[[ ${dws_insecure_dirs[(Ie)$DWS_TEST_UNSAFE_COMPLETIONS]} -gt 0 ]] && "
+                      "compinit -i -d \"$HOME/zcompdump\" && "
+                      "[[ ${fpath[(Ie)$DWS_TEST_UNSAFE_COMPLETIONS]} -eq 0 ]] && " + ready + "\r")
         else:
-            term.send("PS1='DWS_PROMPT> '\r")
-        term.expect("DWS_PROMPT>")
+            term.send("PS1='DWS_PROMPT> '; " + ready + "\r")
+        term.expect("SHELL_READY", screen=False)
         hook = f"DWS_COMPLETE={shell} {shlex.quote(str(BINARY))}"
         activation = f"source <({hook})" if shell == "zsh" else f'eval "$({hook})"'
-        term.send(f"{activation}; printf 'HOOK_READY\\n'\r")
-        term.expect("HOOK_READY")
+        term.send(f"{activation}; printf 'HOOK_%s\\n' READY\r")
+        term.expect("HOOK_READY", screen=False)
         term.read(0.3)
         mark = len(term.output)
         term.send("dws op\t --he\t\r")
